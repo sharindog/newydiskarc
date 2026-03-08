@@ -1,6 +1,6 @@
 # Core Architecture
 
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: Modular Core Logic
 The application logic MUST be split into single-responsibility modules rather than a monolithic `processor.py` file.

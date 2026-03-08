@@ -1,9 +1,9 @@
-# Proposal: Refactor Architecture and Modernize Tooling
+                    # Proposal: Refactor Architecture and Modernize Tooling
 
 ## Goal
 Improve the `ydiskarc` repository by modernizing the Python support, refactoring the core logic, enforcing strict CI/CD linting, and adopting performance enhancements.
 
-## Motivation
+## Why
 Based on the repository analysis:
 1. **End-of-Life Tooling**: The project officially supports Python 3.6, 3.7, and 3.8 which are EOL. The build system is split across `pyproject.toml`, `setup.py`, and `setup.cfg`.
 2. **Architecture**: The `ydiskarc/cmds/processor.py` is over 800 lines long, violating the Single Responsibility Principle by mixing HTTP logic, file I/O operations, Yandex API details, and CLI wrappers. 
@@ -11,7 +11,7 @@ Based on the repository analysis:
 4. **Performance Issues**: Downloads are sequential, which limits throughput on public resources with many small files.
 5. **Safety**: Downloads stream directly to the final filename, potentially leaving corrupted files on interrupted or failed transfers.
 
-## Proposed Changes
+## What Changes
 1. **Update Python Constraints**: Bump the minimum supported Python version to 3.9+ and consolidate the build configuration into `pyproject.toml`.
 2. **Architectural Splitting**:
    - `client.py`: For Yandex API specific requests and session handling.
