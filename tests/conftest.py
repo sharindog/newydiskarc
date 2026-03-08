@@ -24,7 +24,7 @@ def sample_metadata():
         "size": 1024,
         "created": "2024-01-01T00:00:00Z",
         "modified": "2024-01-01T00:00:00Z",
-        "mime_type": "text/plain"
+        "mime_type": "text/plain",
     }
 
 
@@ -44,8 +44,8 @@ def sample_dir_metadata():
                     "type": "file",
                     "path": "disk:/test_dir/file1.txt",
                     "size": 512,
-                    "file": "https://example.com/file1.txt"
+                    "file": "https://example.com/file1.txt",
                 }
             ]
-        }
+        },
     }

@@ -7,7 +7,8 @@ import typer
 
 import ydiskarc
 
-from .cmds.processor import Project, validate_yandex_url
+from .cmds.processor import Project
+from .client import YandexDiskClient
 
 # Create Typer app
 app = typer.Typer(
@@ -58,7 +59,7 @@ def full(
     as ZIP files containing all files inside.
     """
     setup_logging(verbose)
-    if not validate_yandex_url(url):
+    if not YandexDiskClient.validate_yandex_url(url):
         typer.echo(
             f"Invalid Yandex.Disk URL: {url}\n"
             "URL must be in format: https://disk.yandex.ru/d/... or https://disk.yandex.ru/i/...",
@@ -107,7 +108,7 @@ def sync(
     and saves metadata for each directory level.
     """
     setup_logging(verbose)
-    if not validate_yandex_url(url):
+    if not YandexDiskClient.validate_yandex_url(url):
         typer.echo(
             f"Invalid Yandex.Disk URL: {url}\n"
             "URL must be in format: https://disk.yandex.ru/d/... or https://disk.yandex.ru/i/...",
