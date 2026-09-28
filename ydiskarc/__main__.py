@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 """The main entry point. Invoke as `ydiskarc' or `python -m ydiskarc`."""
+
 import sys
 
 import typer

@@ -1,201 +1,277 @@
 import logging
 import os
 import re
-import subprocess
-from typing import Dict, Optional, Any
+from contextlib import closing
+from dataclasses import dataclass
+from typing import Callable, Optional
+from urllib.parse import unquote
 
 import requests
-from tqdm import tqdm
 
-from .config import config
 from .client import YandexDiskClient
+from .config import config
+from .utils import Cancelled, format_size, fs_path, new_hasher, set_mtime
+
+__all__ = [
+    "DownloadError",
+    "HttpStatusError",
+    "IncompleteDownload",
+    "ResourceDownloader",
+    "VerificationError",
+    "format_size",
+]
+
+logger = logging.getLogger(__name__)
+
+ProgressCallback = Callable[[int], None]
 
 
-def format_size(size_bytes: int) -> str:
-    """Format size in bytes to human-readable format."""
-    size: float = float(size_bytes)
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size < 1024.0:
-            return f"{size:.2f} {unit}"
-        size /= 1024.0
-    return f"{size:.2f} PB"
+class DownloadError(Exception):
+    """A file could not be downloaded."""
+
+
+class HttpStatusError(DownloadError):
+    def __init__(self, status: int):
+        super().__init__(f"server returned HTTP {status}")
+        self.status = status
+
+
+class IncompleteDownload(DownloadError):
+    """Connection ended before the whole file was received (the partial file is kept)."""
+
+
+class VerificationError(DownloadError):
+    """Downloaded data does not match the size or checksum reported by the API."""
+
+
+@dataclass
+class DownloadResult:
+    path: str
+    size: int
+    downloaded: int  # bytes received over the network
+    resumed: bool
+    verified: bool  # checksum was checked
+
+
+def _filename_from_headers(resp: requests.Response) -> Optional[str]:
+    header = resp.headers.get("Content-Disposition", "")
+    match = re.search(r"filename\*=(?:UTF-8|utf-8)''([^;]+)", header)
+    if match:
+        return unquote(match.group(1).strip().strip('"'))
+    match = re.search(r'filename="?([^";]+)"?', header)
+    if match:
+        try:
+            return match.group(1).encode("latin-1").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            return match.group(1)
+    return None
 
 
 class ResourceDownloader:
-    """Handles file downloads with tracking, resuming, and safety (.part files)."""
+    """Downloads files safely.
 
-    def __init__(self, client: YandexDiskClient, verbose: bool = False):
+    * data is written to ``<name>.ydpart`` and renamed only after it has been verified;
+    * interrupted downloads are resumed with HTTP Range requests;
+    * the size and the SHA-256 (or MD5) reported by the API are checked, including the
+      part that was downloaded before a resume;
+    * HTTP errors are never written into the file - they raise :class:`DownloadError`;
+    * network errors and stalled connections are retried, refreshing the download link.
+    """
+
+    def __init__(
+        self,
+        client: YandexDiskClient,
+        verbose: bool = False,
+        attempts: Optional[int] = None,
+    ):
         self.client = client
         self.verbose = verbose
+        self.attempts = attempts or config.download_attempts
+
+    def download(
+        self,
+        url: Optional[str],
+        dest: str,
+        size: Optional[int] = None,
+        sha256: Optional[str] = None,
+        md5: Optional[str] = None,
+        mtime: Optional[float] = None,
+        refresh_url: Optional[Callable[[], str]] = None,
+        on_progress: Optional[ProgressCallback] = None,
+    ) -> DownloadResult:
+        """Download ``url`` to ``dest``. Raises :class:`DownloadError` or :class:`Cancelled`."""
+        part = dest + config.part_suffix
+        last_error: Exception = DownloadError("no download link")
+        for attempt in range(1, self.attempts + 1):
+            self.client.check_cancel()
+            if attempt > 1 or not url:
+                if attempt > 1:
+                    self.client.reset_session()
+                    self.client.sleep(min(config.download_retry_delay * 2 ** (attempt - 2), 120))
+                if refresh_url is not None:
+                    try:
+                        url = refresh_url()
+                    except Cancelled:
+                        raise
+                    except Exception as e:
+                        last_error = e
+                        logger.debug("Failed to refresh download link for %s: %s", dest, e)
+                        continue
+            if not url:
+                continue
+            reported = [0]
+
+            def track(n: int) -> None:
+                reported[0] += n
+                if on_progress is not None:
+                    on_progress(n)
+
+            try:
+                return self._download_once(url, dest, part, size, sha256, md5, mtime, track)
+            except BaseException as e:
+                if not isinstance(e, Exception) or isinstance(e, Cancelled):
+                    raise
+                # Whatever this attempt reported is taken back; a retry reports it again.
+                if reported[0] and on_progress is not None:
+                    on_progress(-reported[0])
+                last_error = e
+                if isinstance(e, HttpStatusError) and e.status in (404, 410) and not refresh_url:
+                    break
+                if not isinstance(e, (DownloadError, requests.RequestException, OSError)):
+                    raise
+            logger.debug(
+                "Attempt %s/%s for %s failed: %s", attempt, self.attempts, dest, last_error
+            )
+        raise DownloadError(str(last_error)) from last_error
+
+    def _download_once(
+        self,
+        url: str,
+        dest: str,
+        part: str,
+        size: Optional[int],
+        sha256: Optional[str],
+        md5: Optional[str],
+        mtime: Optional[float],
+        progress: ProgressCallback,
+    ) -> DownloadResult:
+        part_fs = fs_path(part)
+        existing = os.path.getsize(part_fs) if os.path.exists(part_fs) else 0
+        if size is not None and existing > size:
+            os.remove(part_fs)
+            existing = 0
+
+        hasher, expected = new_hasher(sha256, md5)
+        if existing and hasher is not None:
+            with open(part_fs, "rb") as f:
+                for block in iter(lambda: f.read(1024 * 1024), b""):
+                    self.client.check_cancel()
+                    hasher.update(block)
+
+        resumed = existing > 0
+        received = 0
+        if existing:
+            progress(existing)
+        if size == 0 and not existing:
+            os.makedirs(os.path.dirname(part_fs) or ".", exist_ok=True)
+            open(part_fs, "wb").close()
+        elif size is None or existing < size:
+            received, restarted, hasher = self._fetch(
+                url, part_fs, existing, size, hasher, sha256, md5, progress
+            )
+            if restarted:
+                resumed = False
+
+        actual = os.path.getsize(part_fs)
+        if size is not None and actual != size:
+            if actual < size:
+                raise IncompleteDownload(f"got {actual} of {size} bytes")
+            os.remove(part_fs)
+            raise VerificationError(f"size mismatch: got {actual}, expected {size} bytes")
+        verified = False
+        if hasher is not None:
+            if hasher.hexdigest() != expected:
+                os.remove(part_fs)
+                raise VerificationError("checksum mismatch")
+            verified = True
+
+        os.replace(part_fs, fs_path(dest))
+        set_mtime(dest, mtime)
+        logger.debug("Downloaded %s (%s bytes, resumed=%s)", dest, actual, resumed)
+        return DownloadResult(dest, actual, received, resumed, verified)
+
+    def _fetch(self, url, part_fs, existing, size, hasher, sha256, md5, progress):
+        """Stream the (rest of the) file into ``part_fs``.
+
+        Returns ``(received_bytes, restarted_from_zero, hasher)``.
+        """
+        headers = {"Range": f"bytes={existing}-"} if existing else {}
+        resp = self.client.session.get(url, headers=headers, stream=True, timeout=config.timeout)
+        with closing(resp):
+            if resp.status_code == 429:
+                self.client.handle_rate_limit(resp)
+                raise HttpStatusError(429)
+            if resp.status_code == 416:
+                # Range not satisfiable: the partial file is unusable.
+                os.remove(part_fs)
+                raise IncompleteDownload("server rejected resume request")
+            if resp.status_code >= 400:
+                raise HttpStatusError(resp.status_code)
+
+            restarted = False
+            if existing and resp.status_code != 206:
+                # The server ignored the Range header and sends the whole file.
+                progress(-existing)
+                existing = 0
+                restarted = True
+                hasher, _ = new_hasher(sha256, md5)
+
+            expected_length = resp.headers.get("Content-Length")
+            received = 0
+            os.makedirs(os.path.dirname(part_fs) or ".", exist_ok=True)
+            with open(part_fs, "ab" if existing else "wb") as f:
+                for chunk in resp.iter_content(chunk_size=config.chunk_size):
+                    self.client.check_cancel()
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+                    if hasher is not None:
+                        hasher.update(chunk)
+                    received += len(chunk)
+                    progress(len(chunk))
+            if size is None and expected_length and expected_length.isdigit():
+                if received < int(expected_length):
+                    raise IncompleteDownload(f"got {received} of {expected_length} bytes")
+        return received, restarted, hasher
 
     def get_file(
         self,
         url: str,
         filepath: Optional[str] = None,
         filename: Optional[str] = None,
-        params: Optional[Dict[str, Any]] = None,
-        aria2: bool = False,
-        aria2path: Optional[str] = None,
-        makedirs: bool = True,
         filesize: Optional[int] = None,
-        resume: bool = True,
-    ) -> None:
-        """
-        Download a file from a URL with progress tracking and resume support.
-        Downloads are written to a `.part` extension during the process.
-        """
-        session = self.client.session
-        headers: Dict[str, str] = {}
-
-        try:
-            page = session.get(
-                url,
-                params=params,
-                headers=headers,
-                stream=True,
-                verify=True,
-                timeout=config.timeout,
-            )
-            if page.status_code == 429:
-                self.client.handle_rate_limit(page)
-                page = session.get(
-                    url,
-                    params=params,
-                    headers=headers,
-                    stream=True,
-                    verify=True,
-                    timeout=config.timeout,
-                )
-            page.raise_for_status()
-        except requests.exceptions.RequestException as e:
-            if self.verbose:
-                logging.error(f"Failed to download file from {url}: {e}")
-            raise
-
-        # Determine target filename
+        sha256: Optional[str] = None,
+        md5: Optional[str] = None,
+        mtime: Optional[float] = None,
+        on_progress: Optional[ProgressCallback] = None,
+        refresh_url: Optional[Callable[[], str]] = None,
+    ) -> DownloadResult:
+        """Download a file into ``filepath`` (the name is taken from the server if omitted)."""
         if filename is None:
-            if "Content-Disposition" in page.headers.keys():
-                try:
-                    fname = (
-                        re.findall("filename=(.+)", page.headers["Content-Disposition"])[0]
-                        .strip('"')
-                        .encode("latin-1")
-                        .decode("utf-8")
-                    )
-                except (IndexError, UnicodeDecodeError):
-                    fname = url.split("/")[-1]
-            else:
-                fname = url.split("/")[-1]
-            if filepath:
-                filename = os.path.join(filepath, fname)
-            else:
-                filename = fname
-        elif filepath is not None:
-            filename = os.path.join(filepath, filename)
-
-        # Temporary file for downloading
-        part_filename = f"{filename}.part"
-
-        # Check for existing file or partial file
-        existing_size = 0
-        if resume and os.path.exists(part_filename):
-            existing_size = os.path.getsize(part_filename)
-        elif resume and os.path.exists(filename):
-            existing_size = os.path.getsize(filename)
-            part_filename = filename  # Resume the actual file if no .part is present
-
-        if existing_size > 0:
-            page.close()
-            headers["Range"] = f"bytes={existing_size}-"
-            if self.verbose:
-                logging.info(f"Resuming download from byte {existing_size}")
-
-            try:
-                page = session.get(
-                    url,
-                    params=params,
-                    headers=headers,
-                    stream=True,
-                    verify=True,
-                    timeout=config.timeout,
+            with closing(self.client.session.get(url, stream=True, timeout=config.timeout)) as resp:
+                filename = _filename_from_headers(resp) or unquote(
+                    url.split("?")[0].rstrip("/").rsplit("/", 1)[-1]
                 )
-                if page.status_code == 429:
-                    self.client.handle_rate_limit(page)
-                    page = session.get(
-                        url,
-                        params=params,
-                        headers=headers,
-                        stream=True,
-                        verify=True,
-                        timeout=config.timeout,
-                    )
-                page.raise_for_status()
-            except requests.exceptions.RequestException as e:
-                if self.verbose:
-                    logging.error(f"Failed to resume download from {url}: {e}")
-                raise
-
-        # Create directory if needed
-        if makedirs and filepath:
-            os.makedirs(filepath, exist_ok=True)
-
-        if not aria2:
-            remaining = (
-                filesize - existing_size
-                if existing_size > 0 and filesize is not None
-                else (filesize if filesize is not None else None)
-            )
-            desc = f"Downloading {os.path.basename(filename)}" + (
-                " (resuming)" if existing_size > 0 else ""
-            )
-
-            if self.verbose:
-                logging.info(f"Retrieving file to {part_filename}")
-
-            try:
-                mode = "ab" if existing_size > 0 and resume else "wb"
-                with open(part_filename, mode) as f:
-                    total = existing_size
-                    with tqdm(
-                        total=remaining,
-                        desc=desc,
-                        unit="B",
-                        unit_scale=True,
-                        disable=filesize is None,
-                    ) as pbar:
-                        for chunk in page.iter_content(chunk_size=config.chunk_size):
-                            if chunk:
-                                f.write(chunk)
-                                total += len(chunk)
-                                if filesize is not None:
-                                    pbar.update(len(chunk))
-
-                # Rename .part to requested filename upon successful completion
-                if part_filename != filename:
-                    os.rename(part_filename, filename)
-
-                if self.verbose:
-                    logging.info(f"Successfully downloaded {filename} ({total} bytes)")
-            except Exception as e:
-                if self.verbose:
-                    logging.error(f"Failed to write file {filename}: {e}")
-                raise
-        else:
-            if aria2path is None:
-                raise ValueError("aria2path must be provided when using aria2")
-
-            dirpath = os.path.dirname(filename)
-            basename = os.path.basename(filename)
-
-            try:
-                cmd = [aria2path, "--retry-wait=10", "--out", basename, url]
-                if len(dirpath) > 0:
-                    cmd = [aria2path, "--retry-wait=10", "-d", dirpath, "--out", basename, url]
-
-                subprocess.run(cmd, check=True, timeout=3600)
-                if self.verbose:
-                    logging.info(f"Successfully downloaded {filename} using aria2")
-            except subprocess.CalledProcessError as e:
-                if self.verbose:
-                    logging.error(f"aria2 download failed: {e}")
-                raise
+        dest = os.path.join(filepath, filename) if filepath else filename
+        if filepath:
+            os.makedirs(fs_path(filepath), exist_ok=True)
+        return self.download(
+            url,
+            dest,
+            size=filesize,
+            sha256=sha256,
+            md5=md5,
+            mtime=mtime,
+            refresh_url=refresh_url,
+            on_progress=on_progress,
+        )

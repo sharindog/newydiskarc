@@ -2,19 +2,17 @@
 
 from unittest.mock import patch, MagicMock
 
-
-
 try:
     from typer.testing import CliRunner
 except ImportError:
     # Fallback for older typer versions
     from click.testing import CliRunner
-    import typer
 
     # Typer apps can be tested with Click's CliRunner
     CliRunner = CliRunner
 
-from ydiskarc.core import app
+import ydiskarc
+from ydiskarc.core import app, default_output
 
 
 class TestCLI:
@@ -54,7 +52,7 @@ class TestCLI:
         mock_project = MagicMock()
         mock_project_class.return_value = mock_project
 
-        result = self.runner.invoke(
+        self.runner.invoke(
             app, ["full", "https://disk.yandex.ru/d/test123", "--output", "/tmp/test"]
         )
         mock_project.full.assert_called_once()
@@ -71,7 +69,7 @@ class TestCLI:
         mock_project = MagicMock()
         mock_project_class.return_value = mock_project
 
-        result = self.runner.invoke(
+        self.runner.invoke(
             app, ["sync", "https://disk.yandex.ru/d/test123", "--output", "/tmp/test"]
         )
         mock_project.sync.assert_called_once()
@@ -87,7 +85,7 @@ class TestCLI:
         result = self.runner.invoke(app, ["version"])
         assert result.exit_code == 0
         assert "ydiskarc" in result.stdout
-        assert "1.1.0" in result.stdout
+        assert ydiskarc.__version__ in result.stdout
 
     def test_full_command_invalid_url(self):
         """Test full command rejects invalid URL."""
@@ -112,7 +110,7 @@ class TestCLI:
         mock_project = MagicMock()
         mock_project_class.return_value = mock_project
 
-        result = self.runner.invoke(
+        self.runner.invoke(
             app, ["full", "https://disk.yandex.ru/d/ABC123", "--output", "/tmp/test"]
         )
         mock_project.full.assert_called_once()
@@ -124,7 +122,51 @@ class TestCLI:
         mock_project = MagicMock()
         mock_project_class.return_value = mock_project
 
-        result = self.runner.invoke(
+        self.runner.invoke(
             app, ["sync", "https://disk.yandex.ru/i/XYZ789", "--output", "/tmp/test"]
         )
         mock_project.sync.assert_called_once()
+
+    def test_update_option_is_gone(self):
+        """Update mode is always on now; the old flag is rejected."""
+        result = self.runner.invoke(app, ["sync", "https://disk.yandex.ru/d/ABC", "--update"])
+        assert result.exit_code != 0
+
+    @patch("ydiskarc.core.Project")
+    def test_sync_passes_options(self, mock_project_class):
+        mock_project = MagicMock()
+        mock_project_class.return_value = mock_project
+        result = self.runner.invoke(
+            app,
+            [
+                "sync",
+                "https://disk.yandex.ru/d/ABC123/Folder",
+                "-o",
+                "/tmp/test",
+                "-t",
+                "5",
+                "-r",
+                "0",
+                "--flat",
+                "--verify",
+                "--safe-names",
+                "-n",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        kwargs = mock_project.sync.call_args.kwargs
+        assert kwargs["threads"] == 5
+        assert kwargs["retries"] == 0
+        assert kwargs["flat"] is True
+        assert kwargs["verify"] is True
+        assert kwargs["safe_names"] is True
+        assert kwargs["nofiles"] is True
+
+    def test_sync_accepts_subfolder_url(self):
+        result = self.runner.invoke(app, ["sync", "--help"])
+        assert result.exit_code == 0
+        assert "--threads" in result.stdout
+
+    def test_default_output(self):
+        assert default_output("https://disk.yandex.ru/d/ABC123") == "ABC123"
+        assert default_output("https://disk.yandex.ru/d/ABC123/%D0%90/Sub") == "Sub"

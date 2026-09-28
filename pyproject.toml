@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ydiskarc"
-version = "1.1.0"
+version = "1.2.0"
 description = "Command-line tool to backup public resources from Yandex.Disk"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -21,6 +21,8 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Environment :: Console",
+    "Environment :: X11 Applications",
+    "Environment :: Win32 (MS Windows)",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
     "License :: OSI Approved :: MIT License",
@@ -35,7 +37,6 @@ dependencies = [
     "PyYAML>=6.0.1",
     "requests>=2.31.0",
     "rich>=13.6.0",
-    "tqdm>=4.66.0",
 ]
 
 [project.optional-dependencies]
@@ -56,8 +57,11 @@ Issues = "https://github.com/ruarxive/ydiskarc/issues"
 [project.scripts]
 ydiskarc = "ydiskarc.__main__:main"
 
+[project.gui-scripts]
+ydiskarc-gui = "ydiskarc.gui:main"
+
 [tool.setuptools]
-packages = ["ydiskarc"]
+packages = ["ydiskarc", "ydiskarc.cmds"]
 
 [tool.black]
 line-length = 100

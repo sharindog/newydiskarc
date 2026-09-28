@@ -8,7 +8,9 @@ import typer
 import ydiskarc
 
 from .cmds.processor import Project
-from .client import YandexDiskClient
+from .client import YandexDiskClient, parse_public_url
+from .config import config
+from .utils import sanitize_filename
 
 # Create Typer app
 app = typer.Typer(
@@ -17,20 +19,71 @@ app = typer.Typer(
     add_completion=False,
 )
 
+INVALID_URL_HELP = (
+    "URL must be in format: https://disk.yandex.ru/d/... or https://disk.yandex.ru/i/...\n"
+    "A link to a subfolder copied from the browser (https://disk.yandex.ru/d/KEY/Folder) "
+    "is accepted too."
+)
 
-def setup_logging(verbose: bool = False) -> None:
+
+def _console():
+    from rich.console import Console
+
+    return Console(stderr=True)
+
+
+def setup_logging(verbose: bool = False, console=None) -> None:
     """Setup logging configuration.
 
     Args:
-        verbose: If True, enable verbose logging. If False, disable logging.
+        verbose: If True, show debug messages (including HTTP requests); otherwise only
+            warnings and errors are logged.
+        console: rich console shared with the progress bars, so that log lines do not
+            break them.
     """
-    if verbose:
-        logging.basicConfig(
-            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.DEBUG
-        )
-    else:
-        # Disable logging when not verbose
-        logging.disable(logging.CRITICAL)
+    from rich.logging import RichHandler
+
+    handler = RichHandler(
+        console=console or _console(), show_path=verbose, rich_tracebacks=verbose, markup=False
+    )
+    root = logging.getLogger()
+    for old in list(root.handlers):
+        root.removeHandler(old)
+    root.addHandler(handler)
+    root.setLevel(logging.DEBUG if verbose else logging.WARNING)
+    # urllib3 reports every retry as a warning; the downloader reports failures itself.
+    logging.getLogger("urllib3").setLevel(logging.DEBUG if verbose else logging.ERROR)
+    logging.disable(logging.NOTSET)
+
+
+def _check_url(url: str) -> None:
+    if not YandexDiskClient.validate_yandex_url(url):
+        typer.echo(f"Invalid Yandex.Disk URL: {url}\n{INVALID_URL_HELP}", err=True)
+        raise typer.Exit(1)
+
+
+def default_output(url: str) -> str:
+    """Default output folder: the resource key, or the name of the linked subfolder."""
+    parsed = parse_public_url(url)
+    if parsed is None:
+        return url.rstrip("/").rsplit("/", 1)[-1]
+    if parsed.path.strip("/"):
+        return sanitize_filename(parsed.path.rstrip("/").rsplit("/", 1)[-1])
+    return sanitize_filename(parsed.key)
+
+
+def _exit_code(stats) -> int:
+    from .progress import SyncStats
+
+    if not isinstance(stats, SyncStats) or stats.ok:
+        return 0
+    return 130 if stats.cancelled else 1
+
+
+def _make_reporter(console, nofiles: bool = False):
+    from .progress import RichReporter
+
+    return RichReporter(console=console, nofiles=nofiles)
 
 
 @app.command("full")
@@ -43,10 +96,15 @@ def full(
         None,
         "--filename",
         "-f",
-        help="Output filename (if not specified, filename will be auto-detected)",
+        help="Output filename (default: original name of a file, dump.zip for a folder)",
     ),
     metadata: bool = typer.Option(
         False, "--metadata", "-m", help="Extract and save metadata as _metadata.json file"
+    ),
+    safe_names: Optional[bool] = typer.Option(
+        None,
+        "--safe-names/--native-names",
+        help="Replace characters not allowed on Windows/FAT/NTFS (default: on for Windows)",
     ),
     verbose: bool = typer.Option(
         False, "--verbose", "-v", help="Enable verbose output with detailed logging information"
@@ -58,27 +116,30 @@ def full(
     Single files are downloaded with their original format, while directories are downloaded
     as ZIP files containing all files inside.
     """
-    setup_logging(verbose)
-    if not YandexDiskClient.validate_yandex_url(url):
-        typer.echo(
-            f"Invalid Yandex.Disk URL: {url}\n"
-            "URL must be in format: https://disk.yandex.ru/d/... or https://disk.yandex.ru/i/...",
-            err=True,
-        )
-        raise typer.Exit(1)
+    console = _console()
+    setup_logging(verbose, console)
+    _check_url(url)
     try:
         acmd = Project()
-        acmd.full(url, output, filename, metadata, verbose)
+        with _make_reporter(console) as reporter:
+            stats = acmd.full(
+                url, output, filename, metadata, verbose, reporter=reporter, safe_names=safe_names
+            )
     except Exception as e:
-        if verbose:
-            logging.error(f"Error during full download: {e}")
+        logging.debug("Error during full download", exc_info=True)
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(1)
+    code = _exit_code(stats)
+    if code:
+        raise typer.Exit(code)
 
 
 @app.command("sync")
 def sync(
-    url: str = typer.Argument(..., help="URL of the public Yandex.Disk resource to synchronize"),
+    url: str = typer.Argument(
+        ...,
+        help="URL of the public Yandex.Disk folder (or of a subfolder, copied from the browser)",
+    ),
     output: Optional[str] = typer.Option(
         None,
         "--output",
@@ -88,14 +149,37 @@ def sync(
             "(defaults to resource ID if not specified)"
         ),
     ),
-    update: bool = typer.Option(
-        False, "--update", help="Update mode: only download files that do not already exist locally"
-    ),
     nofiles: bool = typer.Option(
         False,
         "--nofiles",
         "-n",
-        help="Metadata-only mode: collect and save metadata without downloading files",
+        help="Metadata-only mode: save _metadata.json for every folder, download no files",
+    ),
+    threads: int = typer.Option(
+        config.threads, "--threads", "-t", min=1, max=16, help="Number of parallel downloads"
+    ),
+    retries: int = typer.Option(
+        config.retry_rounds,
+        "--retries",
+        "-r",
+        min=0,
+        help="Extra passes over files and folders that failed",
+    ),
+    flat: bool = typer.Option(
+        False,
+        "--flat",
+        help="Save all files directly into the output folder, without the folder tree "
+        "(for very long paths)",
+    ),
+    safe_names: Optional[bool] = typer.Option(
+        None,
+        "--safe-names/--native-names",
+        help="Replace characters not allowed on Windows/FAT/NTFS (default: on for Windows)",
+    ),
+    verify: bool = typer.Option(
+        False,
+        "--verify",
+        help="Check SHA-256 of files that already exist locally (slow for big backups)",
     ),
     verbose: bool = typer.Option(
         False, "--verbose", "-v", help="Enable verbose output with detailed logging information"
@@ -103,28 +187,49 @@ def sync(
 ):
     """Synchronize files and metadata from a public Yandex.Disk resource.
 
-    This command recursively synchronizes files and metadata from a public Yandex.Disk
-    directory resource to a local directory. It maintains the directory structure
-    and saves metadata for each directory level.
+    Files that already exist locally and are up to date are skipped, new and changed files
+    are downloaded, checked against the size and SHA-256 reported by Yandex.Disk and get
+    their original modification time. Interrupted downloads are resumed.
     """
-    setup_logging(verbose)
-    if not YandexDiskClient.validate_yandex_url(url):
-        typer.echo(
-            f"Invalid Yandex.Disk URL: {url}\n"
-            "URL must be in format: https://disk.yandex.ru/d/... or https://disk.yandex.ru/i/...",
-            err=True,
-        )
-        raise typer.Exit(1)
+    console = _console()
+    setup_logging(verbose, console)
+    _check_url(url)
     if output is None:
-        output = url.rsplit("/d/", 1)[-1] if "/d/" in url else url.rsplit("/i/", 1)[-1]
+        output = default_output(url)
     try:
         acmd = Project()
-        acmd.sync(url, output, update, nofiles, verbose)
+        with _make_reporter(console, nofiles) as reporter:
+            stats = acmd.sync(
+                url,
+                output,
+                nofiles=nofiles,
+                verbose=verbose,
+                threads=threads,
+                flat=flat,
+                safe_names=safe_names,
+                verify=verify,
+                retries=retries,
+                reporter=reporter,
+            )
     except Exception as e:
-        if verbose:
-            logging.error(f"Error during sync: {e}")
+        logging.debug("Error during sync", exc_info=True)
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(1)
+    code = _exit_code(stats)
+    if code:
+        raise typer.Exit(code)
+
+
+@app.command("gui")
+def gui(
+    url: Optional[str] = typer.Argument(None, help="URL to put into the window"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Log debug messages to console"),
+):
+    """Open the graphical interface."""
+    setup_logging(verbose)
+    from .gui import run_gui
+
+    run_gui(url)
 
 
 @app.command("version")

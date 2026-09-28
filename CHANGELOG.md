@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-09-28
+
+### Changed
+- **BREAKING**: `--update` was removed from `sync`: existing up-to-date files are always
+  skipped, new and changed files are always downloaded
+- `sync` writes `_metadata.json` only with `--nofiles` (and then only metadata)
+- `full` saves single files under their original name instead of `dump.zip`
+- Progress bars use rich (overall + per file); tqdm is no longer a dependency
+- `-v` now really shows debug logs (including HTTP requests) without breaking progress bars
+
+### Added
+- Graphical interface: `ydiskarc gui` / `ydiskarc-gui`, with a download folder picker
+- Downloading a single subfolder by its browser URL (percent-encoded or "pretty")
+- SHA-256 (MD5 fallback) and size verification of every downloaded file, including resumed
+  ones; `--verify` also checks files that already exist
+- Temporary `*.ydpart` files, renamed only after verification
+- Original modification dates for files and folders
+- Parallel downloads (`--threads`), extra passes over failed files and folders (`--retries`)
+- Summary at the end with the names of files and folders that failed; exit code 1 if any
+- `--flat` (no folder tree) and `--safe-names` (Windows-compatible names), long path
+  support on Windows, shortening of too long names
+- Pagination of folder listings (folders with more than 1000 items)
+
+### Fixed
+- Files with quotes and with `%3F` in their names are downloaded
+- HTTP errors are reported as warnings instead of being written into the downloaded file
+- No hang after sleep mode: read timeouts, reconnects and refreshed download links
+- No crash when the server does not respond
+- The `ydiskarc.cmds` package was missing from the built distribution
+
 ## [1.0.1] - 2021-11-26
 
 ### Added

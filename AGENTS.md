@@ -30,7 +30,7 @@ Keep this managed block so 'openspec update' can refresh the instructions.
 **Purpose**: Command-line interface and user interaction
 
 **Responsibilities**:
-- Exposes user-facing commands (`sync`, `full`, `version`)
+- Exposes user-facing commands (`sync`, `full`, `gui`, `version`)
 - Validates user input and URLs
 - Manages logging configuration
 - Routes commands to the appropriate processor
@@ -77,13 +77,13 @@ Keep this managed block so 'openspec update' can refresh the instructions.
 **Key Functions**:
 - `create_session_with_retries()` - Configures HTTP session with exponential backoff
 - `handle_rate_limit()` - Implements rate limit waiting strategy
-- `get_file()` - Downloads files with progress tracking and resume support
+- `ResourceDownloader.download()` - Downloads, verifies and resumes files (`downloader.py`)
 
 **Features**:
 - **Retry Strategy**: 3 retries with exponential backoff (0.5s, 1s, 2s)
 - **Rate Limiting**: Automatic detection and waiting based on `Retry-After` header
 - **Resume Support**: Detects partial downloads and continues from last byte
-- **Progress Tracking**: Uses `tqdm` for visual progress bars
+- **Progress Tracking**: Reports to a `Reporter` (rich progress bars or the GUI)
 
 ---
 
@@ -111,7 +111,7 @@ Keep this managed block so 'openspec update' can refresh the instructions.
 **Responsibilities**:
 - Recursively scans directory structures
 - Calculates total file count and size
-- Identifies files to skip in update mode
+- Identifies files that already exist locally (update mode is always on)
 - Provides pre-download statistics to users
 
 **Key Functions**:
@@ -133,17 +133,21 @@ Total size: 10.12 MB
 **Responsibilities**:
 - Recursively processes directory structures
 - Maintains local directory hierarchy
-- Handles update mode (skip existing files)
+- Skips files that are already downloaded and up to date
 - Supports metadata-only mode
 
 **Key Functions**:
 - `yd_get_and_store_dir()` - Recursive directory processing
 - Implements both iterative and recursive traversal
 
+**Implementation**: `SyncEngine` in `sync.py` (scan folders with pagination, then download
+with a thread pool, then extra passes over failed files/folders, then a summary).
+
 **Modes**:
-- **Full Sync**: Downloads all files and metadata
-- **Update Mode**: Only downloads new files
-- **Metadata-Only**: Saves metadata without downloading files
+- **Sync** (always incremental): downloads new and changed files, skips up-to-date ones
+  (size + date, or size + checksum), resumes `*.ydpart` files, writes no metadata
+- **Metadata-Only** (`--nofiles`): saves `_metadata.json` per folder, no files
+- **Flat** (`--flat`): all files in the output folder, no tree
 
 ---
 
@@ -165,7 +169,16 @@ Total size: 10.12 MB
 
 ---
 
-### 8. Configuration Manager (`config.py`)
+### 8. Progress reporting (`progress.py`) and GUI (`gui.py`)
+
+`Reporter` is a thread-safe event interface (scan progress, file start/progress/end,
+messages, final `SyncStats`). `RichReporter` renders console progress bars; `GuiReporter`
+feeds the tkinter window, which runs the engine in a background thread and can cancel it
+through a `threading.Event`. Messages for the GUI are translated via `i18n.py`.
+
+---
+
+### 9. Configuration Manager (`config.py`)
 
 **Purpose**: Centralized configuration management
 
@@ -233,7 +246,7 @@ graph TD
 ### User Feedback
 
 1. **Verbose Mode**: Detailed logging when enabled with `-v` flag
-2. **Progress Bars**: Visual feedback using `tqdm`
+2. **Progress Bars**: Visual feedback using rich (or the GUI)
 3. **Pre-download Stats**: Shows what will be downloaded before starting
 4. **Error Messages**: Clear, actionable error messages
 
@@ -249,11 +262,11 @@ graph TD
 
 ### Custom Download Strategies
 
-The `get_file()` function supports:
-- Custom chunk sizes (default: 1MB)
-- Alternative download tools (aria2 support)
-- Custom headers and parameters
-- Resume capability toggle
+`ResourceDownloader.download()` supports:
+- Chunk size, timeouts and retry delays from `config.py`
+- Size and SHA-256/MD5 verification, `*.ydpart` temporary files and Range resume
+- A `refresh_url` callback to get a fresh link after an error
+- An `on_progress` callback (may receive negative values when a failed attempt is rolled back)
 
 ### Metadata Processing
 
@@ -270,13 +283,13 @@ Metadata is stored as JSON and can be extended:
 
 - **typer**: Modern CLI framework
 - **requests**: HTTP client library
-- **tqdm**: Progress bar library
 - **pyyaml**: Configuration file parsing
-- **rich**: Terminal formatting
+- **rich**: Terminal formatting and progress bars
+- **tkinter** (standard library, optional): graphical interface
 
 ### Python Version
 
-- Requires Python 3.6 or greater
+- Requires Python 3.9 or greater
 
 ---
 
@@ -302,10 +315,8 @@ pytest
 
 ### Potential Agent Additions
 
-1. **Parallel Download Agent**: Multi-threaded downloads for faster backups
 2. **Compression Agent**: On-the-fly compression for storage optimization
 3. **Deduplication Agent**: Detect and skip duplicate files
-4. **Verification Agent**: Checksum verification for downloaded files
 5. **Notification Agent**: Send notifications on completion or errors
 6. **Scheduling Agent**: Automated periodic backups
 
