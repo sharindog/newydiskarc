@@ -39,6 +39,9 @@ def fast(monkeypatch):
         ("list_page_size", 2),
         ("read_timeout", 5),
         ("chunk_size", 64 * 1024),
+        # deep.dat (300 KB) is downloaded in 3 segments, the other files in one stream
+        ("segment_size", 100 * 1024),
+        ("min_segment_size", 100 * 1024),
     ]:
         monkeypatch.setattr(config, name, value)
 
@@ -201,7 +204,8 @@ class TestSync:
         assert "Files not downloaded: 1" in summary
         assert "a.txt" in summary
 
-    def test_transient_errors_are_retried_and_resumed(self, disk, tmp_path):
+    def test_transient_errors_are_retried_and_resumed(self, disk, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "min_segment_size", 1024 * 1024)  # single-stream downloads
         disk.fail_download["/a.txt"] = 2
         disk.truncate_once.add("/Папка/Sub/deep.dat")
         disk.corrupt_once.add('/Папка/b "quoted".bin')
@@ -326,6 +330,91 @@ class TestDownloader:
         )
         assert result.verified
         assert dest.read_bytes() == b""
+
+    def _deep(self, disk):
+        content = TREE["/Папка/Sub/deep.dat"]
+        url = disk.base + "/dl?path=/%D0%9F%D0%B0%D0%BF%D0%BA%D0%B0/Sub/deep.dat"
+        return content, url, hashlib.sha256(content).hexdigest()
+
+    def test_segmented_download(self, disk, tmp_path):
+        content, url, sha = self._deep(disk)
+        dest = tmp_path / "deep.dat"
+        downloader = ResourceDownloader(YandexDiskClient(), connections=3)
+        result = downloader.download(url, str(dest), size=len(content), sha256=sha)
+        assert result.verified and not result.resumed
+        assert dest.read_bytes() == content
+        ranges = sorted(r[2] for r in dl_requests(disk))
+        assert ranges == ["bytes=0-102399", "bytes=102400-204799", "bytes=204800-307199"]
+        assert not (tmp_path / ("deep.dat" + config.part_suffix + ".state")).exists()
+
+    def test_segmented_resume_from_state(self, disk, tmp_path):
+        content, url, sha = self._deep(disk)
+        part = tmp_path / ("deep.dat" + config.part_suffix)
+        # first segment complete, second half done, third not started
+        data = bytearray(len(content))
+        data[:102400] = content[:102400]
+        data[102400:153600] = content[102400:153600]
+        part.write_bytes(bytes(data))
+        state = {
+            "size": len(content),
+            "segments": [[0, 102400, 102400], [102400, 204800, 51200], [204800, 307200, 0]],
+        }
+        (tmp_path / ("deep.dat" + config.part_suffix + ".state")).write_text(json.dumps(state))
+        dest = tmp_path / "deep.dat"
+        downloader = ResourceDownloader(YandexDiskClient(), connections=2)
+        result = downloader.download(url, str(dest), size=len(content), sha256=sha)
+        assert result.resumed
+        assert result.downloaded == len(content) - 153600
+        assert dest.read_bytes() == content
+        assert sorted(r[2] for r in dl_requests(disk)) == [
+            "bytes=153600-204799",
+            "bytes=204800-307199",
+        ]
+
+    def test_segmented_continues_single_stream_part(self, disk, tmp_path):
+        content, url, sha = self._deep(disk)
+        (tmp_path / ("deep.dat" + config.part_suffix)).write_bytes(content[:150000])
+        dest = tmp_path / "deep.dat"
+        result = ResourceDownloader(YandexDiskClient(), connections=4).download(
+            url, str(dest), size=len(content), sha256=sha
+        )
+        assert result.resumed
+        assert result.downloaded == len(content) - 150000
+        assert dest.read_bytes() == content
+
+    def test_segmented_falls_back_without_range_support(self, disk, tmp_path):
+        disk.ignore_range = True
+        content, url, sha = self._deep(disk)
+        dest = tmp_path / "deep.dat"
+        progress = []
+        result = ResourceDownloader(YandexDiskClient(), connections=3).download(
+            url, str(dest), size=len(content), sha256=sha, on_progress=progress.append
+        )
+        assert result.verified
+        assert dest.read_bytes() == content
+        assert sum(progress) == len(content)
+
+    def test_segmented_broken_connection(self, disk, tmp_path):
+        content, url, sha = self._deep(disk)
+        disk.truncate_once.add("/Папка/Sub/deep.dat")
+        dest = tmp_path / "deep.dat"
+        progress = []
+        result = ResourceDownloader(YandexDiskClient(), connections=3).download(
+            url, str(dest), size=len(content), sha256=sha, on_progress=progress.append
+        )
+        assert result.verified
+        assert dest.read_bytes() == content
+        assert sum(progress) == len(content)
+
+    def test_segmented_corrupt_data_is_redownloaded(self, disk, tmp_path):
+        content, url, sha = self._deep(disk)
+        disk.corrupt_once.add("/Папка/Sub/deep.dat")
+        dest = tmp_path / "deep.dat"
+        result = ResourceDownloader(YandexDiskClient(), connections=3).download(
+            url, str(dest), size=len(content), sha256=sha
+        )
+        assert result.verified
+        assert dest.read_bytes() == content
 
     def test_http_error_raises(self, disk, tmp_path):
         with pytest.raises(DownloadError):

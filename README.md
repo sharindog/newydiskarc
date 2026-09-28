@@ -21,7 +21,9 @@ Yandex provides free-to-use API that allow to download the data.
 * **Any file names** - quotes, `%3F` and other odd characters in names are supported;
   `--safe-names` makes names valid on Windows/FAT/NTFS, long names are shortened
 * **Original dates** - files and folders get their modification time from Yandex.Disk
-* **Parallel downloads** - several files at once (`--threads`)
+* **Parallel downloads** - several files at once (`--threads`), and big files in segments
+  over several connections (`--connections`), which matters because Yandex.Disk limits the
+  speed of a single connection
 * **Progress and statistics** - overall and per-file progress bars, and a summary at the end
   including the names of files that could not be downloaded
 * **Graphical interface** - `ydiskarc gui` / `ydiskarc-gui`, with a folder picker
@@ -109,7 +111,11 @@ $ ydiskarc sync https://disk.yandex.ru/d/VVNMYpZtWtST9Q -o mos9maystyle --nofile
 - `--output`, `-o` - Output directory (defaults to resource ID or the subfolder name)
 - `--nofiles`, `-n` - Metadata-only mode: save `_metadata.json` for every folder and no files.
   Without this flag no metadata is written.
-- `--threads`, `-t` - Number of parallel downloads (default: 3)
+- `--threads`, `-t` - Number of files downloaded in parallel (default: 3, up to 64)
+- `--connections`, `-c` - Connections per file (default: 4, up to 16). Files bigger than
+  4 MB are split into segments (2-16 MB) that are downloaded in parallel; progress is kept in
+  `*.ydpart.state`, so an interrupted file continues where it stopped. The total number of
+  connections is up to `threads × connections`.
 - `--retries`, `-r` - Extra passes over files and folders that failed (default: 3)
 - `--flat` - Save all files directly into the output folder, without the folder tree
   (for shares with paths too long for the file system)
@@ -268,7 +274,9 @@ Files not downloaded: 1
   каждый файл сверяется по размеру и SHA-256 и получает исходную дату.
 * Ошибка скачивания — это предупреждение, а не текст ошибки внутри файла; неудачные файлы и
   папки повторяются (`-r`), в конце печатается статистика и список нескачанных файлов.
-* `-t N` — число параллельных закачек, `--flat` — все файлы в одну папку (для очень длинных
+* `-t N` — сколько файлов качать одновременно, `-c N` — сколько соединений на один файл
+  (большие файлы качаются кусками параллельно; Яндекс ограничивает скорость одного
+  соединения, так что это главный способ ускориться), `--flat` — все файлы в одну папку (для очень длинных
   путей), `--safe-names` — имена, допустимые в Windows, `-n` — только метаданные.
 
 ## Contributing

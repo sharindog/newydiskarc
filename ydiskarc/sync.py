@@ -67,6 +67,7 @@ class SyncEngine:
         output: str,
         nofiles: bool = False,
         threads: Optional[int] = None,
+        connections: Optional[int] = None,
         flat: bool = False,
         safe_names: Optional[bool] = None,
         verify: bool = False,
@@ -91,7 +92,7 @@ class SyncEngine:
         self.reporter = reporter or Reporter()
         self.cancel_event = cancel_event or threading.Event()
         self.client = YandexDiskClient(verbose=verbose, cancel_event=self.cancel_event)
-        self.downloader = ResourceDownloader(self.client, verbose=verbose)
+        self.downloader = ResourceDownloader(self.client, verbose=verbose, connections=connections)
         self.stats = SyncStats()
         self._lock = threading.Lock()
         self._failed_tasks: Dict[str, FileTask] = {}

@@ -28,6 +28,12 @@ class Config:
     download_retry_delay: float = 5.0  # first pause between download attempts, doubled
     list_page_size: int = 1000
     threads: int = 3
+    max_threads: int = 64
+    # Big files are downloaded in segments over several connections at once.
+    connections_per_file: int = 4
+    max_connections_per_file: int = 16
+    segment_size: int = 16 * 1024 * 1024  # largest segment
+    min_segment_size: int = 2 * 1024 * 1024  # files up to twice this use one connection
     part_suffix: str = ".ydpart"
     user_agent: Optional[str] = None  # Auto-generated if None
 
