@@ -33,6 +33,7 @@ def yd_get_full(
     reporter: Optional[Reporter] = None,
     cancel_event: Optional[threading.Event] = None,
     safe_names: Optional[bool] = None,
+    connections: Optional[int] = None,
 ) -> SyncStats:
     """Download a public file, or a public folder as a ZIP archive."""
     parsed = parse_public_url(url)
@@ -40,7 +41,7 @@ def yd_get_full(
         raise ValueError(f"Invalid Yandex.Disk URL: {url}")
     reporter = reporter or Reporter()
     client = YandexDiskClient(verbose=verbose, cancel_event=cancel_event)
-    downloader = ResourceDownloader(client, verbose=verbose)
+    downloader = ResourceDownloader(client, verbose=verbose, connections=connections)
     stats = SyncStats(started=time.time())
     path = parsed.path or None
     if output is None:
@@ -150,6 +151,7 @@ class Project:
         nofiles: bool = False,
         verbose: bool = False,
         threads: Optional[int] = None,
+        connections: Optional[int] = None,
         flat: bool = False,
         safe_names: Optional[bool] = None,
         verify: bool = False,
@@ -163,6 +165,7 @@ class Project:
             output,
             nofiles=nofiles,
             threads=threads,
+            connections=connections,
             flat=flat,
             safe_names=safe_names,
             verify=verify,
@@ -182,7 +185,15 @@ class Project:
         verbose: bool = False,
         reporter: Optional[Reporter] = None,
         safe_names: Optional[bool] = None,
+        connections: Optional[int] = None,
     ) -> SyncStats:
         return yd_get_full(
-            url, output, filename, metadata, verbose, reporter=reporter, safe_names=safe_names
+            url,
+            output,
+            filename,
+            metadata,
+            verbose,
+            reporter=reporter,
+            safe_names=safe_names,
+            connections=connections,
         )

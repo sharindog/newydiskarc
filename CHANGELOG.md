@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-09-28
+
+### Added
+- Segmented downloads: files bigger than 4 MB are fetched by several connections at once
+  (`--connections`/`-c`, default 4; "Соединений на файл" in the GUI). Segment progress is
+  stored in `*.ydpart.state` for resuming; the whole file is verified with SHA-256 after
+  assembly. Falls back to a single stream if the server ignores Range requests.
+- Up to 64 files in parallel (`--threads`)
+
 ## [1.2.0] - 2026-09-28
 
 ### Changed

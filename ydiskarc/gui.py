@@ -183,6 +183,9 @@ class App:
         self.dir_var = tk.StringVar(value=self.settings.get("output") or default_download_dir())
         self.subdir_var = tk.BooleanVar(value=self.settings.get("subdir", True))
         self.threads_var = tk.IntVar(value=int(self.settings.get("threads", config.threads)))
+        self.connections_var = tk.IntVar(
+            value=int(self.settings.get("connections", config.connections_per_file))
+        )
         self.retries_var = tk.IntVar(value=int(self.settings.get("retries", config.retry_rounds)))
         self.nofiles_var = tk.BooleanVar(value=False)
         self.flat_var = tk.BooleanVar(value=self.settings.get("flat", False))
@@ -220,23 +223,25 @@ class App:
 
         opts = ttk.LabelFrame(main, text="Параметры", padding=6)
         opts.grid(row=3, column=0, columnspan=3, sticky="ew", **pad)
-        ttk.Label(opts, text="Потоков:").grid(row=0, column=0, sticky="w", padx=4)
-        ttk.Spinbox(opts, from_=1, to=16, width=4, textvariable=self.threads_var).grid(
-            row=0, column=1, sticky="w", padx=4
-        )
-        ttk.Label(opts, text="Повторов для неудачных:").grid(row=0, column=2, sticky="w", padx=4)
-        ttk.Spinbox(opts, from_=0, to=10, width=4, textvariable=self.retries_var).grid(
-            row=0, column=3, sticky="w", padx=4
-        )
+        spins = [
+            ("Файлов одновременно:", self.threads_var, 1, config.max_threads),
+            ("Соединений на файл:", self.connections_var, 1, config.max_connections_per_file),
+            ("Повторов для неудачных:", self.retries_var, 0, 10),
+        ]
+        for i, (text, var, low, high) in enumerate(spins):
+            ttk.Label(opts, text=text).grid(row=0, column=2 * i, sticky="w", padx=4)
+            ttk.Spinbox(opts, from_=low, to=high, width=4, textvariable=var).grid(
+                row=0, column=2 * i + 1, sticky="w", padx=(0, 12)
+            )
         checks = [
             ("Только метаданные (_metadata.json), без файлов", self.nofiles_var),
             ("Все файлы в одну папку, без дерева (для очень длинных путей)", self.flat_var),
             ("Проверять SHA-256 уже скачанных файлов (медленно)", self.verify_var),
             ('Имена файлов, допустимые в Windows (замена " ? * : < > |)', self.safe_var),
         ]
-        for i, (text, var) in enumerate(checks):
-            ttk.Checkbutton(opts, text=text, variable=var).grid(
-                row=1 + i, column=0, columnspan=4, sticky="w", padx=4
+        for i, (text, flag) in enumerate(checks):
+            ttk.Checkbutton(opts, text=text, variable=flag).grid(
+                row=1 + i, column=0, columnspan=6, sticky="w", padx=4
             )
 
         buttons = ttk.Frame(main)
@@ -350,6 +355,7 @@ class App:
             output=self.dir_var.get(),
             subdir=bool(self.subdir_var.get()),
             threads=self._int(self.threads_var, config.threads),
+            connections=self._int(self.connections_var, config.connections_per_file),
             retries=self._int(self.retries_var, config.retry_rounds),
             flat=bool(self.flat_var.get()),
             verify=bool(self.verify_var.get()),
@@ -405,6 +411,7 @@ class App:
             subdir=bool(self.subdir_var.get()),
             nofiles=bool(self.nofiles_var.get()),
             threads=max(1, self._int(self.threads_var, config.threads)),
+            connections=max(1, self._int(self.connections_var, config.connections_per_file)),
             retries=max(0, self._int(self.retries_var, config.retry_rounds)),
             flat=bool(self.flat_var.get()),
             verify=bool(self.verify_var.get()),
@@ -432,6 +439,7 @@ class App:
                 target,
                 nofiles=options["nofiles"],
                 threads=options["threads"],
+                connections=options["connections"],
                 flat=options["flat"],
                 safe_names=options["safe_names"],
                 verify=options["verify"],

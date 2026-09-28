@@ -3,6 +3,7 @@
 import hashlib
 import json
 import threading
+import time
 from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, Optional
@@ -34,6 +35,7 @@ class FakeYandexDisk:
         self.fail_listing: Dict[str, int] = defaultdict(int)  # folder listing 500 N times
         self.wrong_sha: set = set()  # API reports a wrong checksum (always)
         self.ignore_range = False
+        self.throttle = 0  # bytes per second per connection, 0 = unlimited
         self.requests = []
         self.lock = threading.Lock()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
@@ -173,17 +175,17 @@ class FakeYandexDisk:
                 content = disk.files[path]
                 if corrupt:
                     content = bytes(len(content))
-                start = 0
+                start, end = 0, len(content) - 1
                 range_header = self.headers.get("Range")
                 if range_header and not disk.ignore_range:
-                    start = int(range_header.split("=")[1].split("-")[0])
+                    first, _, last = range_header.split("=")[1].partition("-")
+                    start = int(first)
+                    end = min(int(last), end) if last else end
                     self.send_response(206)
-                    self.send_header(
-                        "Content-Range", f"bytes {start}-{len(content) - 1}/{len(content)}"
-                    )
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{len(content)}")
                 else:
                     self.send_response(200)
-                body = content[start:]
+                body = content[start : end + 1]
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Content-Type", "application/octet-stream")
                 self.end_headers()
@@ -197,6 +199,12 @@ class FakeYandexDisk:
                     self.wfile.write(body[: len(body) // 2])
                     self.wfile.flush()
                     self.close_connection = True
+                    return
+                if disk.throttle:
+                    step = max(disk.throttle // 20, 1)
+                    for i in range(0, len(body), step):
+                        self.wfile.write(body[i : i + step])
+                        time.sleep(step / disk.throttle)
                     return
                 self.wfile.write(body)
 

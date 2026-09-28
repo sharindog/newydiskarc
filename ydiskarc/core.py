@@ -106,6 +106,14 @@ def full(
         "--safe-names/--native-names",
         help="Replace characters not allowed on Windows/FAT/NTFS (default: on for Windows)",
     ),
+    connections: int = typer.Option(
+        config.connections_per_file,
+        "--connections",
+        "-c",
+        min=1,
+        max=config.max_connections_per_file,
+        help="Connections for a big file (it is downloaded in segments in parallel)",
+    ),
     verbose: bool = typer.Option(
         False, "--verbose", "-v", help="Enable verbose output with detailed logging information"
     ),
@@ -123,7 +131,14 @@ def full(
         acmd = Project()
         with _make_reporter(console) as reporter:
             stats = acmd.full(
-                url, output, filename, metadata, verbose, reporter=reporter, safe_names=safe_names
+                url,
+                output,
+                filename,
+                metadata,
+                verbose,
+                reporter=reporter,
+                safe_names=safe_names,
+                connections=connections,
             )
     except Exception as e:
         logging.debug("Error during full download", exc_info=True)
@@ -156,7 +171,20 @@ def sync(
         help="Metadata-only mode: save _metadata.json for every folder, download no files",
     ),
     threads: int = typer.Option(
-        config.threads, "--threads", "-t", min=1, max=16, help="Number of parallel downloads"
+        config.threads,
+        "--threads",
+        "-t",
+        min=1,
+        max=config.max_threads,
+        help="Number of files downloaded in parallel",
+    ),
+    connections: int = typer.Option(
+        config.connections_per_file,
+        "--connections",
+        "-c",
+        min=1,
+        max=config.max_connections_per_file,
+        help="Connections per big file (it is downloaded in segments in parallel)",
     ),
     retries: int = typer.Option(
         config.retry_rounds,
@@ -205,6 +233,7 @@ def sync(
                 nofiles=nofiles,
                 verbose=verbose,
                 threads=threads,
+                connections=connections,
                 flat=flat,
                 safe_names=safe_names,
                 verify=verify,
