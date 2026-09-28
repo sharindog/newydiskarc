@@ -1,187 +1,122 @@
+import json
 import logging
 import os
-import yaml
-from typing import Optional
+import threading
+import time
+from typing import Any, Dict, Optional
 
-from ydiskarc.client import YandexDiskClient
-from ydiskarc.downloader import ResourceDownloader, format_size
+import yaml
+
+from ydiskarc.client import YandexDiskClient, parse_public_url
+from ydiskarc.downloader import ResourceDownloader
+from ydiskarc.progress import FileTask, Reporter, SyncStats
+from ydiskarc.sync import METADATA_FILENAME, SyncEngine
+from ydiskarc.utils import (
+    Cancelled,
+    file_checksum_matches,
+    fs_path,
+    mtime_matches,
+    parse_timestamp,
+    sanitize_filename,
+    set_mtime,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def yd_get_full(
-    url: str, output: Optional[str], filename: Optional[str], metadata: bool, verbose: bool = False
-) -> None:
-    client = YandexDiskClient(verbose=verbose)
+    url: str,
+    output: Optional[str],
+    filename: Optional[str],
+    metadata: bool,
+    verbose: bool = False,
+    reporter: Optional[Reporter] = None,
+    cancel_event: Optional[threading.Event] = None,
+    safe_names: Optional[bool] = None,
+) -> SyncStats:
+    """Download a public file, or a public folder as a ZIP archive."""
+    parsed = parse_public_url(url)
+    if parsed is None:
+        raise ValueError(f"Invalid Yandex.Disk URL: {url}")
+    reporter = reporter or Reporter()
+    client = YandexDiskClient(verbose=verbose, cancel_event=cancel_event)
     downloader = ResourceDownloader(client, verbose=verbose)
-
-    if output:
-        os.makedirs(output, exist_ok=True)
-
-    try:
-        resp = client.get_resource_metadata(url)
-        metadata_data = resp.json()
-
-        if metadata and output:
-            metadata_file = os.path.join(output, "_metadata.json")
-            with open(metadata_file, "w", encoding="utf8") as f:
-                f.write(resp.text)
-            if verbose:
-                logging.info(f"Metadata saved to {metadata_file}")
-    except Exception as e:
-        if verbose:
-            logging.error(f"Failed to fetch metadata: {e}")
-        # Proceed without metadata
-        metadata_data = None
-
-    id = url.rsplit("/", 1)[-1]
+    stats = SyncStats(started=time.time())
+    path = parsed.path or None
     if output is None:
-        output = id
-
-    if filename is None:
-        filename = "dump.zip"
-
-    resource_type = metadata_data.get("type", "file") if metadata_data else "file"
-    filesize = metadata_data.get("size") if metadata_data else None
-
-    if resource_type == "dir":
-        try:
-            file_count, total_size = scan_directory_for_stats(
-                url, "", output, update=False, nofiles=False, verbose=verbose
-            )
-            size_str = format_size(total_size) if total_size > 0 else "0 B"
-            print(f"Total files to download: 1 (ZIP archive containing {file_count} file(s))")
-            print(f"Total size: {size_str}")
-        except Exception:
-            print("Total files to download: 1 (ZIP archive)")
-            print("Total size: unknown")
-    else:
-        if filesize is not None:
-            print("Total files to download: 1")
-            print(f"Total size: {format_size(filesize)}")
-        else:
-            print("Total files to download: 1")
-            print("Total size: unknown")
+        output = parsed.key
 
     try:
-        download_url = client.get_download_link(url)
-        downloader.get_file(download_url, filepath=output, filename=filename, filesize=filesize)
+        data = client.get_resource_metadata(parsed.public_key, path=path, limit=1).json()
+        os.makedirs(fs_path(output), exist_ok=True)
+        if metadata:
+            with open(fs_path(os.path.join(output, METADATA_FILENAME)), "w", encoding="utf8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            stats.metadata_files = 1
+
+        is_dir = data.get("type") == "dir"
+        if filename is None:
+            filename = "dump.zip" if is_dir else data.get("name") or parsed.key
+            filename = sanitize_filename(filename, safe_names)
+        size = None if is_dir else data.get("size")
+        task = FileTask(
+            remote_path=data.get("path") or "/",
+            local_path=os.path.join(output, filename),
+            display=filename,
+            size=size,
+            sha256=None if is_dir else data.get("sha256"),
+            md5=None if is_dir else data.get("md5"),
+            modified=parse_timestamp(data.get("modified")),
+        )
+        stats.dirs = 1 if is_dir else 0
+        stats.total_files = 1
+        stats.total_bytes = size or 0
+
+        local = fs_path(task.local_path)
+        if not is_dir and os.path.exists(local) and os.path.getsize(local) == size:
+            if mtime_matches(local, task.modified) or file_checksum_matches(
+                local, task.sha256, task.md5, client.cancel_event
+            ) in (True, None):
+                set_mtime(task.local_path, task.modified)
+                stats.skipped_files = 1
+                reporter.start(stats, 0, 0, 0)
+                reporter.file_end(task, "skipped")
+                return stats
+
+        stats.todo_files = 1
+        stats.todo_bytes = size or 0
+        reporter.start(stats, 0, 1, size or 0)
+        reporter.file_start(task)
+        try:
+            result = downloader.download(
+                None,
+                task.local_path,
+                size=task.size,
+                sha256=task.sha256,
+                md5=task.md5,
+                mtime=task.modified,
+                refresh_url=lambda: client.get_download_link(parsed.public_key, path),
+                on_progress=lambda n: reporter.file_progress(task, n),
+            )
+        except Exception as e:
+            stats.failed_files[task.display] = str(e)
+            reporter.file_end(task, "failed", str(e))
+        else:
+            stats.downloaded_files = 1
+            stats.downloaded_bytes = result.size
+            stats.received_bytes = result.downloaded
+            stats.resumed_files = int(result.resumed)
+            stats.verified_files = int(result.verified)
+            reporter.file_end(task, "downloaded")
+    except (Cancelled, KeyboardInterrupt):
+        stats.cancelled = True
     except Exception as e:
-        if verbose:
-            logging.error(f"Failed to get file: {e}")
-        raise ValueError(f"Failed to download resource: {e}")
-
-
-def scan_directory_for_stats(
-    url: str,
-    path: str,
-    output: str,
-    update: bool = True,
-    nofiles: bool = False,
-    verbose: bool = False,
-) -> tuple[int, int]:
-    client = YandexDiskClient(verbose=verbose)
-    file_count = 0
-    total_size = 0
-
-    resp = client.get_resource_metadata(url, path=path, limit=1000)
-    data = resp.json()
-
-    if "_embedded" in data and "items" in data["_embedded"]:
-        for row in data["_embedded"]["items"]:
-            if "path" not in row:
-                continue
-
-            if row["type"] == "dir":
-                try:
-                    sub_count, sub_size = scan_directory_for_stats(
-                        url, row["path"], output, update, nofiles, verbose
-                    )
-                    file_count += sub_count
-                    total_size += sub_size
-                except Exception as e:
-                    if verbose:
-                        logging.error(f"Failed to scan subdirectory {row['path']}: {e}")
-            elif row["type"] == "file":
-                if nofiles:
-                    continue
-
-                arr = [output] + [i.rstrip() for i in row["path"].split("/") if i.strip()]
-                file_path = os.path.join(*arr[:-1])
-                file_name = arr[-1]
-                full_file_path = os.path.join(file_path, file_name)
-
-                if os.path.exists(full_file_path) and update:
-                    continue
-
-                file_count += 1
-                if "size" in row and row["size"] is not None:
-                    total_size += row["size"]
-
-    return file_count, total_size
-
-
-def yd_get_and_store_dir(
-    url: str,
-    path: str,
-    output: str,
-    update: bool = True,
-    nofiles: bool = False,
-    iterative: bool = False,
-    verbose: bool = False,
-):
-    client = YandexDiskClient(verbose=verbose)
-    downloader = ResourceDownloader(client, verbose=verbose)
-
-    resp = client.get_resource_metadata(url, path=path, limit=1000)
-    data = resp.json()
-
-    arr = [output] + [i.rstrip() for i in path.split("/") if i.strip()]
-    dir_path = os.path.join(*arr)
-    os.makedirs(dir_path, exist_ok=True)
-
-    metadata_file = os.path.join(dir_path, "_metadata.json")
-    with open(metadata_file, "w", encoding="utf8") as f:
-        f.write(resp.text)
-
-    if not iterative:
-        return data
-
-    if "_embedded" in data and "items" in data["_embedded"]:
-        for row in data["_embedded"]["items"]:
-            if "path" not in row:
-                continue
-
-            if row["type"] == "dir":
-                arr = [output] + [i.rstrip() for i in path.split("/") if i.strip()]
-                row_path = os.path.join(*arr)
-                os.makedirs(row_path, exist_ok=True)
-
-                try:
-                    yd_get_and_store_dir(
-                        url, row["path"], output, update, nofiles, iterative=True, verbose=verbose
-                    )
-                except Exception as e:
-                    if verbose:
-                        logging.error(f"Failed to process subdirectory {row['path']}: {e}")
-
-            elif row["type"] == "file":
-                if nofiles:
-                    continue
-
-                arr = [output] + [i.rstrip() for i in row["path"].split("/") if i.strip()]
-                file_path = os.path.join(*arr[:-1])
-                file_name = arr[-1]
-                full_file_path = os.path.join(file_path, file_name)
-
-                if os.path.exists(full_file_path) and update:
-                    continue
-
-                try:
-                    downloader.get_file(
-                        row["file"], file_path, filename=file_name, filesize=row.get("size")
-                    )
-                except Exception as e:
-                    if verbose:
-                        logging.error(f"Failed to download file {row['path']}: {e}")
+        logger.debug("Full download failed", exc_info=True)
+        stats.error = str(e) or e.__class__.__name__
+    finally:
+        stats.finished = time.time()
+        reporter.finish(stats)
+    return stats
 
 
 class Project:
@@ -195,7 +130,7 @@ class Project:
             projectdir = os.getcwd()
         filepath = os.path.join(projectdir, ".ydiskarc")
 
-        conf = {}
+        conf: Dict[str, Any] = {}
         if os.path.exists(filepath):
             with open(filepath, "r", encoding="utf8") as f:
                 conf = yaml.safe_load(f) or {}
@@ -206,49 +141,37 @@ class Project:
 
         with open(filepath, "w", encoding="utf8") as f:
             yaml.safe_dump(conf, f)
-        logging.info(f"Configuration saved at {filepath}")
-
-    def __store(
-        self,
-        url: str,
-        metapath: str,
-        update: bool = False,
-        nofiles: bool = False,
-        verbose: bool = False,
-    ) -> None:
-        os.makedirs(metapath, exist_ok=True)
-
-        if not nofiles:
-            try:
-                file_count, total_size = scan_directory_for_stats(
-                    url, "", metapath, update, nofiles, verbose
-                )
-                if file_count > 0:
-                    print(f"Total files to download: {file_count}")
-                    print(f"Total size: {format_size(total_size)}")
-                elif update:
-                    print("All files are already up to date.")
-                    return
-                else:
-                    print("No files found to download.")
-                    return
-            except Exception as e:
-                if verbose:
-                    logging.warning(f"Failed to scan directory for stats: {e}")
-
-        yd_get_and_store_dir(
-            url, "", metapath, update=update, nofiles=nofiles, iterative=True, verbose=verbose
-        )
+        logger.info("Configuration saved at %s", filepath)
 
     def sync(
         self,
         url: str,
         output: str,
-        update: bool = False,
         nofiles: bool = False,
         verbose: bool = False,
-    ) -> None:
-        self.__store(url, output, update, nofiles, verbose)
+        threads: Optional[int] = None,
+        flat: bool = False,
+        safe_names: Optional[bool] = None,
+        verify: bool = False,
+        retries: Optional[int] = None,
+        reporter: Optional[Reporter] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> SyncStats:
+        """Synchronize a public folder. Existing up-to-date files are always skipped."""
+        engine = SyncEngine(
+            url,
+            output,
+            nofiles=nofiles,
+            threads=threads,
+            flat=flat,
+            safe_names=safe_names,
+            verify=verify,
+            retries=retries,
+            reporter=reporter,
+            cancel_event=cancel_event,
+            verbose=verbose,
+        )
+        return engine.run()
 
     def full(
         self,
@@ -257,5 +180,9 @@ class Project:
         filename: Optional[str],
         metadata: bool,
         verbose: bool = False,
-    ) -> None:
-        yd_get_full(url, output, filename, metadata, verbose)
+        reporter: Optional[Reporter] = None,
+        safe_names: Optional[bool] = None,
+    ) -> SyncStats:
+        return yd_get_full(
+            url, output, filename, metadata, verbose, reporter=reporter, safe_names=safe_names
+        )

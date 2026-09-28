@@ -1,129 +1,348 @@
-"""Unit tests for the new architecture."""
+"""Unit and integration tests for the client, the downloader and the sync engine."""
 
+import hashlib
 import json
 import os
-import tempfile
-from unittest.mock import Mock, patch, MagicMock
+import threading
+
+import pytest
+
+from tests.fake_yandex import MODIFIED_TS, FakeYandexDisk
+from ydiskarc.client import YandexDiskClient, parse_public_url
+from ydiskarc.cmds.processor import Project, yd_get_full
+from ydiskarc.config import config
+from ydiskarc.downloader import DownloadError, ResourceDownloader
+from ydiskarc.progress import Reporter, format_summary
+from ydiskarc.utils import sanitize_filename
+
+URL = "https://disk.yandex.ru/d/TestKey123"
+# Quotes are not allowed in Windows file names, so there the safe names are tested.
+SAFE = os.name == "nt"
+
+TREE = {
+    "/a.txt": b"hello",
+    '/Папка/b "quoted".bin': os.urandom(1000),
+    "/Папка/c%3Fd.txt": b"percent name",
+    "/Папка/Sub/deep.dat": os.urandom(300 * 1024),
+    "/empty/": None,
+}
 
 
+@pytest.fixture
+def fast(monkeypatch):
+    """No pauses between retries, small listing pages to exercise pagination."""
+    for name, value in [
+        ("api_retry_delay", 0),
+        ("download_retry_delay", 0),
+        ("retry_round_pause", 0),
+        ("retry_backoff_factor", 0),
+        ("list_page_size", 2),
+        ("read_timeout", 5),
+        ("chunk_size", 64 * 1024),
+    ]:
+        monkeypatch.setattr(config, name, value)
 
-from ydiskarc.client import YandexDiskClient
-from ydiskarc.downloader import ResourceDownloader
-from ydiskarc.cmds.processor import (
-    Project,
-    yd_get_full,
-    yd_get_and_store_dir,
-    scan_directory_for_stats,
-)
+
+@pytest.fixture
+def disk(fast, monkeypatch):
+    with FakeYandexDisk(dict(TREE)) as fake:
+        monkeypatch.setattr(config, "api_base_url", fake.base + "/v1/disk")
+        yield fake
 
 
-class TestClient:
-    def test_validate_yandex_url_valid_directory(self):
+class Recorder(Reporter):
+    def __init__(self):
+        self.messages = []
+        self.ends = []
+        self.progress = 0
+        self.lock = threading.Lock()
+
+    def file_progress(self, task, nbytes):
+        with self.lock:
+            self.progress += nbytes
+
+    def file_end(self, task, status, error=None):
+        with self.lock:
+            self.ends.append((task.display, status))
+
+    def message(self, level, text):
+        self.messages.append((level, text))
+
+
+def local(root, remote_path):
+    """Local path of a remote file, as the sync engine names it."""
+    parts = [sanitize_filename(p, SAFE) for p in remote_path.strip("/").split("/")]
+    return root.joinpath(*parts)
+
+
+def sync(output, url=URL, **kwargs):
+    kwargs.setdefault("safe_names", SAFE)
+    kwargs.setdefault("threads", 2)
+    return Project().sync(url, str(output), **kwargs)
+
+
+def dl_requests(disk):
+    return [r for r in disk.requests if r[0] == "/dl"]
+
+
+class TestParseUrl:
+    def test_root(self):
+        parsed = parse_public_url("https://disk.yandex.ru/d/ABC123")
+        assert parsed.public_key == "https://disk.yandex.ru/d/ABC123"
+        assert parsed.path == ""
+
+    def test_subfolder_percent_encoded(self):
+        parsed = parse_public_url(
+            "https://disk.yandex.ru/d/ABC123/%D0%9F%D0%B0%D0%BF%D0%BA%D0%B0/Sub%20dir/"
+        )
+        assert parsed.public_key == "https://disk.yandex.ru/d/ABC123"
+        assert parsed.path == "/Папка/Sub dir"
+
+    def test_subfolder_pretty(self):
+        parsed = parse_public_url("disk.yandex.com/d/ABC123/Папка/Sub dir?w=1")
+        assert parsed.public_key == "https://disk.yandex.ru/d/ABC123"
+        assert parsed.path == "/Папка/Sub dir"
+
+    def test_other_hosts(self):
+        assert parse_public_url("https://yadi.sk/d/XyZ").public_key == "https://yadi.sk/d/XyZ"
+        assert parse_public_url("https://disk.360.yandex.ru/i/XyZ").kind == "i"
+
+    def test_invalid(self):
+        assert parse_public_url("https://example.com/d/ABC") is None
+        assert parse_public_url("not-a-url") is None
         assert YandexDiskClient.validate_yandex_url("https://disk.yandex.ru/d/ABC123") is True
-
-    def test_validate_yandex_url_invalid(self):
         assert YandexDiskClient.validate_yandex_url("https://example.com/file") is False
 
 
+class TestSanitize:
+    def test_safe_names(self):
+        assert sanitize_filename('a "b" c?.txt', True) == "a ＂b＂ c？.txt"
+        assert sanitize_filename("con.txt", True) == "_con.txt"
+        assert sanitize_filename("name. ", True) == "name__"
+
+    def test_native_names_keep_everything(self):
+        assert sanitize_filename('a "b" c?.txt', False) == 'a "b" c?.txt'
+
+    def test_percent_is_never_decoded(self):
+        assert sanitize_filename("c%3Fd.txt", True) == "c%3Fd.txt"
+        assert sanitize_filename("c%3Fd.txt", False) == "c%3Fd.txt"
+
+    def test_long_names_are_shortened_uniquely(self):
+        a = sanitize_filename("я" * 200 + "a.txt", False)
+        b = sanitize_filename("я" * 200 + "b.txt", False)
+        assert a != b
+        assert a.endswith(".txt")
+        if os.name == "nt":
+            assert len(a) <= 255 - 16
+        else:
+            assert len(a.encode("utf-8")) <= 255 - 16
+
+
+class TestSync:
+    def test_full_sync(self, disk, tmp_path):
+        stats = sync(tmp_path)
+        assert stats.ok, format_summary(stats)
+        for path, content in TREE.items():
+            target = local(tmp_path, path)
+            if content is None:
+                assert target.is_dir()
+                continue
+            assert target.read_bytes() == content
+            assert abs(target.stat().st_mtime - MODIFIED_TS) < 1
+        assert stats.downloaded_files == 4
+        assert stats.verified_files == 4
+        leftovers = [
+            name
+            for _, _, names in os.walk(tmp_path)
+            for name in names
+            if name.endswith(config.part_suffix) or name == "_metadata.json"
+        ]
+        assert leftovers == []
+
+    def test_second_run_downloads_nothing(self, disk, tmp_path):
+        sync(tmp_path)
+        before = len(dl_requests(disk))
+        stats = sync(tmp_path)
+        assert stats.ok
+        assert stats.skipped_files == 4
+        assert stats.downloaded_files == 0
+        assert len(dl_requests(disk)) == before
+
+    def test_changed_files_are_downloaded_again(self, disk, tmp_path):
+        sync(tmp_path)
+        same_size = tmp_path / "a.txt"
+        same_size.write_bytes(b"HELLO")  # same size, new mtime -> checksum is checked
+        other_size = tmp_path / "Папка" / "c%3Fd.txt"
+        other_size.write_bytes(b"short")
+        stats = sync(tmp_path)
+        assert stats.downloaded_files == 2
+        assert same_size.read_bytes() == b"hello"
+        assert other_size.read_bytes() == b"percent name"
+
+    def test_same_size_and_date_is_trusted_without_verify(self, disk, tmp_path):
+        sync(tmp_path)
+        local = tmp_path / "a.txt"
+        local.write_bytes(b"HELLO")
+        os.utime(local, (MODIFIED_TS, MODIFIED_TS))
+        assert sync(tmp_path).downloaded_files == 0
+        assert sync(tmp_path, verify=True).downloaded_files == 1
+        assert local.read_bytes() == b"hello"
+
+    def test_error_is_reported_not_written_into_file(self, disk, tmp_path):
+        disk.fail_download["/a.txt"] = 1000
+        recorder = Recorder()
+        stats = sync(tmp_path, retries=1, reporter=recorder)
+        assert not stats.ok
+        assert list(stats.failed_files) == ["a.txt"]
+        assert not (tmp_path / "a.txt").exists()
+        assert (tmp_path / "Папка" / "c%3Fd.txt").exists()
+        assert any(level == "warning" and "a.txt" in text for level, text in recorder.messages)
+        summary = "\n".join(line for _, line in format_summary(stats))
+        assert "Files not downloaded: 1" in summary
+        assert "a.txt" in summary
+
+    def test_transient_errors_are_retried_and_resumed(self, disk, tmp_path):
+        disk.fail_download["/a.txt"] = 2
+        disk.truncate_once.add("/Папка/Sub/deep.dat")
+        disk.corrupt_once.add('/Папка/b "quoted".bin')
+        recorder = Recorder()
+        stats = sync(tmp_path, reporter=recorder)
+        assert stats.ok, format_summary(stats)
+        assert stats.resumed_files == 1
+        ranges = [r for r in dl_requests(disk) if r[2]]
+        assert ranges and ranges[0][1]["path"] == "/Папка/Sub/deep.dat"
+        assert (tmp_path / "Папка" / "Sub" / "deep.dat").read_bytes() == TREE["/Папка/Sub/deep.dat"]
+        quoted = '/Папка/b "quoted".bin'
+        assert local(tmp_path, quoted).read_bytes() == TREE[quoted]
+        assert recorder.progress == sum(len(v) for v in TREE.values() if v)
+
+    def test_dead_connection_does_not_hang(self, disk, tmp_path, monkeypatch):
+        """A connection that goes silent (e.g. after sleep mode) times out and is resumed."""
+        monkeypatch.setattr(config, "read_timeout", 1)
+        disk.stall_once.add("/Папка/Sub/deep.dat")
+        stats = sync(tmp_path)
+        assert stats.ok, format_summary(stats)
+        assert stats.resumed_files == 1
+        assert (tmp_path / "Папка" / "Sub" / "deep.dat").read_bytes() == TREE["/Папка/Sub/deep.dat"]
+
+    def test_no_server_does_not_crash(self, fast, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "api_base_url", "http://127.0.0.1:9/v1/disk")
+        monkeypatch.setattr(config, "api_attempts", 2)
+        monkeypatch.setattr(config, "connect_timeout", 1)
+        stats = sync(tmp_path, retries=0)
+        assert not stats.ok
+        assert stats.error and "no response" in stats.error
+
+    def test_checksum_mismatch_fails(self, disk, tmp_path):
+        disk.wrong_sha.add("/a.txt")
+        stats = sync(tmp_path, retries=0)
+        assert "a.txt" in stats.failed_files
+        assert "checksum" in stats.failed_files["a.txt"]
+        assert not (tmp_path / "a.txt").exists()
+        assert not (tmp_path / ("a.txt" + config.part_suffix)).exists()
+
+    def test_folder_listing_failure_is_retried(self, disk, tmp_path):
+        disk.fail_listing["/Папка"] = config.api_attempts  # the whole first pass fails
+        stats = sync(tmp_path, retries=1)
+        assert stats.ok, format_summary(stats)
+        assert (tmp_path / "Папка" / "Sub" / "deep.dat").exists()
+
+    def test_metadata_only(self, disk, tmp_path):
+        stats = sync(tmp_path, nofiles=True)
+        assert stats.ok
+        assert not (tmp_path / "a.txt").exists()
+        meta = json.loads((tmp_path / "_metadata.json").read_text(encoding="utf8"))
+        # pages of 2 items were merged
+        assert len(meta["_embedded"]["items"]) == 3
+        assert (tmp_path / "Папка" / "Sub" / "_metadata.json").exists()
+        assert stats.metadata_files == 4
+
+    def test_subfolder_link(self, disk, tmp_path):
+        url = URL + "/%D0%9F%D0%B0%D0%BF%D0%BA%D0%B0"
+        stats = sync(tmp_path, url=url)
+        assert stats.ok
+        assert stats.total_files == 3
+        assert (tmp_path / "Sub" / "deep.dat").exists()
+        assert not (tmp_path / "a.txt").exists()
+        pretty = sync(tmp_path / "pretty", url=URL + "/Папка/Sub")
+        assert pretty.total_files == 1
+        assert (tmp_path / "pretty" / "deep.dat").exists()
+
+    def test_flat_and_safe_names(self, disk, tmp_path):
+        stats = sync(tmp_path, flat=True, safe_names=True)
+        assert stats.ok
+        names = sorted(p.name for p in tmp_path.iterdir())
+        assert names == ["a.txt", "b ＂quoted＂.bin", "c%3Fd.txt", "deep.dat"]
+
+    def test_cancel(self, disk, tmp_path):
+        event = threading.Event()
+        event.set()
+        stats = sync(tmp_path, cancel_event=event)
+        assert stats.cancelled
+        assert not stats.ok
+
+
 class TestDownloader:
-    @patch("ydiskarc.client.YandexDiskClient._create_session_with_retries")
-    @patch("ydiskarc.downloader.open", create=True)
-    @patch("ydiskarc.downloader.os.path.exists")
-    @patch("ydiskarc.downloader.os.rename")
-    def test_get_file_basic(self, mock_rename, mock_exists, mock_open, mock_session_factory):
-        mock_exists.return_value = False
-        mock_session = MagicMock()
-        mock_response = Mock()
-        mock_response.headers = {}
-        mock_response.iter_content.return_value = [b"file content"]
-        mock_response.raise_for_status = Mock()
-        mock_session.get.return_value = mock_response
-        mock_session_factory.return_value = mock_session
+    def _downloader(self):
+        return ResourceDownloader(YandexDiskClient())
 
-        client = YandexDiskClient()
-        # Override session to use our mock
-        client.session = mock_session
+    def test_resume_existing_part(self, disk, tmp_path):
+        content = TREE["/Папка/Sub/deep.dat"]
+        dest = tmp_path / "deep.dat"
+        (tmp_path / ("deep.dat" + config.part_suffix)).write_bytes(content[:1000])
+        result = self._downloader().download(
+            disk.base + "/dl?path=/%D0%9F%D0%B0%D0%BF%D0%BA%D0%B0/Sub/deep.dat",
+            str(dest),
+            size=len(content),
+            sha256=hashlib.sha256(content).hexdigest(),
+        )
+        assert result.resumed and result.verified
+        assert result.downloaded == len(content) - 1000
+        assert dest.read_bytes() == content
 
-        downloader = ResourceDownloader(client)
+    def test_server_ignoring_range_restarts(self, disk, tmp_path):
+        disk.ignore_range = True
+        content = TREE["/a.txt"]
+        dest = tmp_path / "a.txt"
+        (tmp_path / ("a.txt" + config.part_suffix)).write_bytes(b"he")
+        result = self._downloader().download(
+            disk.base + "/dl?path=/a.txt",
+            str(dest),
+            size=len(content),
+            sha256=hashlib.sha256(content).hexdigest(),
+        )
+        assert not result.resumed
+        assert dest.read_bytes() == content
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            mock_file = MagicMock()
-            mock_open.return_value.__enter__.return_value = mock_file
-            downloader.get_file("http://example.com/file.txt", filepath=tmpdir)
+    def test_empty_file(self, disk, tmp_path):
+        disk.files["/empty.txt"] = b""
+        dest = tmp_path / "sub" / "empty.txt"
+        result = self._downloader().download(
+            None,
+            str(dest),
+            size=0,
+            sha256=hashlib.sha256(b"").hexdigest(),
+            refresh_url=lambda: disk.base + "/dl?path=/empty.txt",
+        )
+        assert result.verified
+        assert dest.read_bytes() == b""
 
-        mock_session.get.assert_called_once()
-        mock_file.write.assert_called()
-
-
-class TestYdGetFull:
-    @patch("ydiskarc.cmds.processor.YandexDiskClient")
-    @patch("ydiskarc.cmds.processor.ResourceDownloader")
-    def test_yd_get_full_basic(self, mock_downloader_cls, mock_client_cls):
-        mock_client = MagicMock()
-        mock_client_cls.return_value = mock_client
-
-        mock_meta_resp = Mock()
-        mock_meta_resp.json.return_value = {"type": "file"}
-        mock_meta_resp.raise_for_status = Mock()
-        mock_client.get_resource_metadata.return_value = mock_meta_resp
-
-        mock_client.get_download_link.return_value = "http://example.com/download"
-
-        mock_downloader = MagicMock()
-        mock_downloader_cls.return_value = mock_downloader
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yd_get_full("https://disk.yandex.ru/d/test123", tmpdir, None, False)
-
-        mock_client.get_resource_metadata.assert_called_once()
-        mock_client.get_download_link.assert_called_once()
-        mock_downloader.get_file.assert_called_once()
+    def test_http_error_raises(self, disk, tmp_path):
+        with pytest.raises(DownloadError):
+            self._downloader().download(disk.base + "/dl?path=/missing", str(tmp_path / "x"))
+        assert not (tmp_path / "x").exists()
 
 
-class TestYdGetAndStoreDir:
-    @patch("ydiskarc.cmds.processor.YandexDiskClient")
-    @patch("ydiskarc.cmds.processor.ResourceDownloader")
-    def test_yd_get_and_store_dir_basic(self, mock_downloader_cls, mock_client_cls):
-        mock_client = MagicMock()
-        mock_client_cls.return_value = mock_client
+class TestFull:
+    def test_single_file(self, disk, tmp_path):
+        stats = yd_get_full(URL + "/a.txt", str(tmp_path), None, True)
+        assert stats.ok, format_summary(stats)
+        assert (tmp_path / "a.txt").read_bytes() == b"hello"
+        assert (tmp_path / "_metadata.json").exists()
+        again = yd_get_full(URL + "/a.txt", str(tmp_path), None, False)
+        assert again.skipped_files == 1
 
-        mock_resp = Mock()
-        mock_resp.text = json.dumps({"name": "test_dir", "type": "dir", "_embedded": {"items": []}})
-        mock_resp.json.return_value = {
-            "name": "test_dir",
-            "type": "dir",
-            "_embedded": {"items": []},
-        }
-        mock_resp.raise_for_status = Mock()
-        mock_client.get_resource_metadata.return_value = mock_resp
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            result = yd_get_and_store_dir(
-                "https://disk.yandex.ru/d/test123",
-                "",
-                tmpdir,
-                update=False,
-                nofiles=True,
-                iterative=False,
-            )
-            assert result is not None
-            assert os.path.exists(os.path.join(tmpdir, "_metadata.json"))
-
-
-class TestProject:
-    @patch("builtins.print")
-    @patch("ydiskarc.cmds.processor.scan_directory_for_stats")
-    @patch("ydiskarc.cmds.processor.yd_get_and_store_dir")
-    def test_project_sync(self, mock_yd_get, mock_scan, mock_print):
-        mock_scan.return_value = (1, 100)
-        project = Project()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            project.sync("https://disk.yandex.ru/d/test123", tmpdir, False, False)
-        mock_yd_get.assert_called_once()
-
-    @patch("ydiskarc.cmds.processor.yd_get_full")
-    def test_project_full(self, mock_yd_get):
-        project = Project()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            project.full("https://disk.yandex.ru/d/test123", tmpdir, None, False)
-        mock_yd_get.assert_called_once()
+    def test_folder_as_zip(self, disk, tmp_path):
+        stats = yd_get_full(URL, str(tmp_path), None, False)
+        assert stats.ok, format_summary(stats)
+        assert (tmp_path / "dump.zip").exists()

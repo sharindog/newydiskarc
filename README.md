@@ -6,15 +6,26 @@ Yandex provides free-to-use API that allow to download the data.
 
 ## Main features
 
-* **Metadata extraction** - Automatically saves metadata as `_metadata.json` files
-* **Download any public resource** - Files or entire directories
-* **Resume support** - Automatically resumes interrupted downloads
-* **Retry logic** - Handles transient network failures automatically
-* **Rate limiting handling** - Respects API rate limits
-* **Progress tracking** - Visual progress bars for downloads using tqdm
-* **Pre-download statistics** - Shows total file count and estimated size before downloading
-* **Quiet by default** - Logs only appear when verbose mode is enabled
-* **Update mode** - Only download files that don't already exist locally
+* **Always incremental** - files that are already downloaded and up to date are skipped,
+  new and changed files are downloaded (there is no `--update` flag any more)
+* **Safe downloads** - data goes to a temporary `*.ydpart` file which is renamed only after
+  the size and SHA-256 (MD5 as a fallback) reported by Yandex.Disk have been checked
+* **Resume support** - interrupted downloads continue from the last byte, and the resumed
+  file is verified as a whole
+* **Errors are warnings, not files** - an HTTP error is never written into the file being
+  downloaded; a warning is printed and the file is retried
+* **Resilient** - network errors, dead connections (e.g. after sleep mode), missing server
+  responses and rate limiting are retried; failed files and folders get extra passes
+* **Subfolders** - download only one folder by giving its URL from the browser
+  (`https://disk.yandex.ru/d/KEY/Folder/Subfolder`, percent-encoded or "pretty")
+* **Any file names** - quotes, `%3F` and other odd characters in names are supported;
+  `--safe-names` makes names valid on Windows/FAT/NTFS, long names are shortened
+* **Original dates** - files and folders get their modification time from Yandex.Disk
+* **Parallel downloads** - several files at once (`--threads`)
+* **Progress and statistics** - overall and per-file progress bars, and a summary at the end
+  including the names of files that could not be downloaded
+* **Graphical interface** - `ydiskarc gui` / `ydiskarc-gui`, with a folder picker
+* **Metadata only mode** - `--nofiles` saves `_metadata.json` for every folder
 
 ## Installation
 
@@ -35,7 +46,21 @@ $ pip install --upgrade ydiskarc
 
 ### Python version
 
-Python version 3.6 or greater is required.
+Python version 3.9 or greater is required.
+
+## Graphical interface
+
+```bash
+$ ydiskarc gui
+# or
+$ ydiskarc-gui
+```
+
+Paste a public link (to the whole share or to a subfolder), choose the folder to save into
+with "Обзор…" and press "Скачать". Downloads can be stopped at any time and resumed later by
+pressing "Скачать" again. The GUI uses `tkinter`, which is included in the Python installers
+for Windows and macOS; on Linux install it with your package manager
+(e.g. `apt install python3-tk`).
 
 ## Usage
 
@@ -60,17 +85,18 @@ See also ``python -m ydiskarc`` and ``ydiskarc [command] --help`` for help for e
 
 ### Sync command
 
-Synchronizes files and metadata from public resource of directory type to the local directory.
-Maintains directory structure and saves metadata for each directory level.
+Synchronizes files from a public folder to a local directory, keeping the folder tree.
+Running it again only downloads what is new or changed, so it is safe to re-run after an
+interruption or to update an existing backup.
 
 **Basic usage:**
 ```bash
 $ ydiskarc sync https://disk.yandex.ru/d/VVNMYpZtWtST9Q -o mos9maystyle
 ```
 
-**Update mode (only download new files):**
+**Only one subfolder (URL copied from the browser):**
 ```bash
-$ ydiskarc sync https://disk.yandex.ru/d/VVNMYpZtWtST9Q -o mos9maystyle --update
+$ ydiskarc sync "https://disk.yandex.ru/d/VVNMYpZtWtST9Q/Folder/Subfolder" -o subfolder
 ```
 
 **Metadata only (no file downloads):**
@@ -79,13 +105,27 @@ $ ydiskarc sync https://disk.yandex.ru/d/VVNMYpZtWtST9Q -o mos9maystyle --nofile
 ```
 
 **Options:**
-- `URL` - Public resource URL (required, positional argument)
-- `--output`, `-o` - Output directory (defaults to resource ID)
-- `--update` - Update mode: only download files that don't exist locally
-- `--nofiles`, `-n` - Metadata-only mode: save metadata without downloading files
-- `--verbose`, `-v` - Enable verbose logging (logs are hidden by default)
+- `URL` - Public folder URL, or URL of a subfolder (required, positional argument)
+- `--output`, `-o` - Output directory (defaults to resource ID or the subfolder name)
+- `--nofiles`, `-n` - Metadata-only mode: save `_metadata.json` for every folder and no files.
+  Without this flag no metadata is written.
+- `--threads`, `-t` - Number of parallel downloads (default: 3)
+- `--retries`, `-r` - Extra passes over files and folders that failed (default: 3)
+- `--flat` - Save all files directly into the output folder, without the folder tree
+  (for shares with paths too long for the file system)
+- `--safe-names` / `--native-names` - Replace characters not allowed on Windows/FAT/NTFS
+  (`" ? * : < > |`) with similar looking ones (default: on for Windows)
+- `--verify` - Check the SHA-256 of files that already exist locally even if their size and
+  date match (slow for big backups)
+- `--verbose`, `-v` - Enable verbose logging, including HTTP requests
 
-**Note:** The command now displays total file count and estimated size before starting downloads.
+**How existing files are handled:** a local file is considered up to date when its size and
+modification date match Yandex.Disk. If only the size matches, its checksum is compared (and
+the date is fixed if the content is right). Otherwise the file is downloaded again.
+Partially downloaded `*.ydpart` files are resumed.
+
+The exit code is `0` when everything was downloaded, `1` if some files or folders failed
+(they are listed in the summary) and `130` when stopped with Ctrl+C.
 
 ### Full command
 
@@ -110,12 +150,13 @@ $ ydiskarc full https://disk.yandex.ru/i/t_pNaarK8UJ-bQ -o files -v -m
 **Options:**
 - `URL` - Public resource URL (required, positional argument)
 - `--output`, `-o` - Output directory
-- `--filename`, `-f` - Output filename (defaults to `dump.zip` if not specified)
+- `--filename`, `-f` - Output filename (original name for a file, `dump.zip` for a folder)
 - `--metadata`, `-m` - Extract and save metadata as `_metadata.json`
+- `--safe-names` / `--native-names` - see the `sync` command
 - `--verbose`, `-v` - Enable verbose logging (logs are hidden by default)
 
 **Note:** 
-- Single files are downloaded with their original format
+- Single files are downloaded with their original name, verified and get their original date
 - Directories are downloaded as ZIP files (default filename: `dump.zip`)
 - The command displays file count and size information before downloading
 
@@ -159,8 +200,15 @@ $ ydiskarc configure --key YOUR_OAUTH_KEY
 - Ensure you have write access to the output directory
 
 **Resume interrupted downloads**
-- Downloads automatically resume if interrupted
-- Partial files are detected and resumed from the last byte
+- Just run the same command again: finished files are skipped, `*.ydpart` files are resumed
+  from the last byte and verified
+
+**Some files were not downloaded**
+- Their names and the reasons are printed at the end; run the command again to retry them
+
+**Path too long (Windows)**
+- Long paths are supported via the `\\?\` prefix; if the file system still refuses, use
+  `--flat`
 
 ### Verbose Mode
 
@@ -187,9 +235,9 @@ $ ydiskarc sync https://disk.yandex.ru/d/ABC123 -o my_backup
 $ ydiskarc full https://disk.yandex.ru/i/XYZ789 -o downloads -m
 ```
 
-**Update existing backup (skip existing files):**
+**Update existing backup (only new and changed files are downloaded):**
 ```bash
-$ ydiskarc sync https://disk.yandex.ru/d/ABC123 -o my_backup --update
+$ ydiskarc sync https://disk.yandex.ru/d/ABC123 -o my_backup
 ```
 
 **Get metadata only:**
@@ -199,10 +247,29 @@ $ ydiskarc sync https://disk.yandex.ru/d/ABC123 -o metadata_only --nofiles
 
 **Example output:**
 ```
-Total files to download: 7
-Total size: 10.12 MB
-Downloading: 100%|████████████| 1.72M/1.72M [00:05<00:00, 345KB/s]
+Total: 4 files (4.77 MB) in 3 folders; to download: 4 files (4.77 MB)
+Failed to download a.txt: server returned HTTP 500
+Retry 1/3: 1 file(s), 0 folder(s) in 15 s
+
+Folders: 3, files: 4 (4.77 MB)
+Downloaded: 3 (4.77 MB), resumed: 1, checksum verified: 3
+Already up to date: 0
+Time: 0:03, average speed: 1.52 MB/s
+Files not downloaded: 1
+  a.txt: server returned HTTP 500
 ```
+
+## Кратко по-русски
+
+* `ydiskarc gui` — графический интерфейс: вставьте ссылку, выберите папку («Обзор…»),
+  нажмите «Скачать».
+* `ydiskarc sync ССЫЛКА -o ПАПКА` — скачивает раздачу или одну её подпапку (ссылка из
+  браузера). Уже скачанные файлы пропускаются, недокачанные (`*.ydpart`) докачиваются,
+  каждый файл сверяется по размеру и SHA-256 и получает исходную дату.
+* Ошибка скачивания — это предупреждение, а не текст ошибки внутри файла; неудачные файлы и
+  папки повторяются (`-r`), в конце печатается статистика и список нескачанных файлов.
+* `-t N` — число параллельных закачек, `--flat` — все файлы в одну папку (для очень длинных
+  путей), `--safe-names` — имена, допустимые в Windows, `-n` — только метаданные.
 
 ## Contributing
 
