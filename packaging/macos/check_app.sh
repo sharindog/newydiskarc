@@ -19,11 +19,23 @@ echo "== GUI starts"
 
 echo "== download with the packaged binary"
 WORK="$(mktemp -d)"
-"$PY" packaging/fake_server.py "$WORK/url" &
+"$PY" packaging/fake_server.py "$WORK/url" >"$WORK/server.log" 2>&1 &
 SERVER=$!
 trap 'kill $SERVER 2>/dev/null || true' EXIT
-for _ in $(seq 50); do [ -s "$WORK/url" ] && break; sleep 0.2; done
-YDISKARC_API_BASE_URL="$(cat "$WORK/url")" "$BIN" sync https://disk.yandex.ru/d/Test \
+# Python can take a while to start on a fresh CI machine.
+for _ in $(seq 300); do
+    [ -s "$WORK/url" ] && break
+    if ! kill -0 "$SERVER" 2>/dev/null; then
+        echo "fake server exited:" >&2; cat "$WORK/server.log" >&2; exit 1
+    fi
+    sleep 0.2
+done
+if [ ! -s "$WORK/url" ]; then
+    echo "fake server did not start in 60 s:" >&2; cat "$WORK/server.log" >&2; exit 1
+fi
+API_URL="$(cat "$WORK/url")"
+echo "fake API at $API_URL"
+YDISKARC_API_BASE_URL="$API_URL" "$BIN" sync https://disk.yandex.ru/d/Test \
     -o "$WORK/out" -t 2 -c 4
 test "$(cat "$WORK/out/Папка/c%3Fd.txt")" = "percent name"
 test "$(cat "$WORK/out/Папка/b \"quoted\".txt")" = "quoted name"
