@@ -23,11 +23,29 @@ logger = logging.getLogger(__name__)
 
 SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".ydiskarc-gui.json")
 
-# Physical key codes of V, C, X, A: Tk ignores Ctrl+V & co. with a non-latin keyboard layout.
+IS_MAC = sys.platform == "darwin"
+# Ctrl on Windows/Linux, Cmd on macOS
+MODIFIER = "Command" if IS_MAC else "Control"
+
+# Tk ignores Ctrl+V (Cmd+V) & co. with a non-latin keyboard layout. They are recognised by
+# the physical key code (Windows, Linux) or by the Cyrillic letter on the same key.
 _EDIT_KEYCODES = {
     "win32": {86: "<<Paste>>", 67: "<<Copy>>", 88: "<<Cut>>", 65: "<<SelectAll>>"},
     "linux": {55: "<<Paste>>", 54: "<<Copy>>", 53: "<<Cut>>", 38: "<<SelectAll>>"},
 }
+_EDIT_KEYSYMS = {
+    "Cyrillic_em": "<<Paste>>",
+    "Cyrillic_es": "<<Copy>>",
+    "Cyrillic_che": "<<Cut>>",
+    "Cyrillic_ef": "<<SelectAll>>",
+}
+
+
+def edit_shortcut_event(keysym: str, keycode: int, platform: str = sys.platform) -> Optional[str]:
+    """Virtual event for Ctrl/Cmd + key pressed with a non-latin layout (``None`` otherwise)."""
+    if keysym.lower() in ("v", "c", "x", "a"):
+        return None  # latin layout: Tk handles it itself
+    return _EDIT_KEYSYMS.get(keysym) or _EDIT_KEYCODES.get(platform, {}).get(keycode)
 
 
 class GuiReporter(Reporter):
@@ -286,7 +304,11 @@ class App:
         scroll.pack(side="right", fill="y")
         self.log.tag_configure("warning", foreground="#b36b00")
         self.log.tag_configure("error", foreground="#c00000")
-        self.log.tag_configure("title", font=("TkDefaultFont", 10, "bold"))
+        from tkinter import font as tkfont
+
+        bold = tkfont.nametofont("TkDefaultFont").copy()
+        bold.configure(weight="bold")
+        self.log.tag_configure("title", font=bold)
         panes.add(logframe, weight=2)
 
         menu = tk.Menu(self.root, tearoff=0)
@@ -295,21 +317,68 @@ class App:
         menu.add_command(label="Вставить", command=lambda: self._menu_event("<<Paste>>"))
         self.menu = menu
         self._menu_widget = None
+        # Right click: Button-3 on Windows/Linux; Button-2 or Ctrl+click on macOS.
+        clicks = ("<Button-2>", "<Control-Button-1>") if IS_MAC else ("<Button-3>",)
         for widget in (self.url_entry, self.dir_entry, self.log):
-            widget.bind("<Button-3>", self._show_menu)
+            for click in clicks:
+                widget.bind(click, self._show_menu)
+        if IS_MAC:
+            self._build_mac_menu()
+
+    def _build_mac_menu(self) -> None:
+        """Native macOS menu bar: application menu, Edit menu and Cmd+Q handling."""
+        tk = self.tk
+        menubar = tk.Menu(self.root)
+        app_menu = tk.Menu(menubar, name="apple", tearoff=0)
+        app_menu.add_command(label="О программе ydiskarc", command=self.show_about)
+        menubar.add_cascade(menu=app_menu)
+        edit = tk.Menu(menubar, tearoff=0)
+        for label, event, key in (
+            ("Вырезать", "<<Cut>>", "X"),
+            ("Копировать", "<<Copy>>", "C"),
+            ("Вставить", "<<Paste>>", "V"),
+            ("Выделить всё", "<<SelectAll>>", "A"),
+        ):
+            edit.add_command(
+                label=label,
+                accelerator=f"Command-{key}",
+                command=lambda e=event: self._focused_event(e),
+            )
+        menubar.add_cascade(label="Правка", menu=edit)
+        window = tk.Menu(menubar, name="window", tearoff=0)
+        menubar.add_cascade(label="Окно", menu=window)
+        self.root.configure(menu=menubar)
+        self.root.createcommand("tk::mac::Quit", self.on_close)
+        self.root.createcommand("tk::mac::ShowPreferences", lambda: None)
+        # Clicking the Dock icon brings back a minimized window.
+        self.root.createcommand("tk::mac::ReopenApplication", self.root.deiconify)
+
+    def _focused_event(self, name: str) -> None:
+        widget = self.root.focus_get()
+        if widget is not None:
+            widget.event_generate(name)
+
+    def show_about(self) -> None:
+        from tkinter import messagebox
+
+        import ydiskarc
+
+        messagebox.showinfo(
+            "ydiskarc",
+            f"ydiskarc {ydiskarc.__version__}\n"
+            "Загрузка публичных папок и файлов с Яндекс.Диска.",
+            parent=self.root,
+        )
 
     def _install_edit_shortcuts(self) -> None:
-        codes = _EDIT_KEYCODES.get("win32" if sys.platform == "win32" else sys.platform, {})
-
         def handler(event):
-            virtual = codes.get(event.keycode)
-            if virtual and event.keysym.lower() not in ("v", "c", "x", "a"):
+            virtual = edit_shortcut_event(event.keysym, event.keycode)
+            if virtual:
                 event.widget.event_generate(virtual)
                 return "break"
             return None
 
-        if codes:
-            self.root.bind_all("<Control-KeyPress>", handler, add="+")
+        self.root.bind_all(f"<{MODIFIER}-KeyPress>", handler, add="+")
 
     def _show_menu(self, event) -> None:
         self._menu_widget = event.widget
@@ -597,7 +666,7 @@ class App:
         self.worker = None
 
 
-def run_gui(url: Optional[str] = None) -> None:
+def run_gui(url: Optional[str] = None, smoke_test: bool = False) -> None:
     try:
         import tkinter as tk
     except ImportError:  # pragma: no cover - depends on the Python build
@@ -614,14 +683,24 @@ def run_gui(url: Optional[str] = None) -> None:
         except Exception:
             pass
     set_language("ru")
-    root = tk.Tk()
+    root = tk.Tk(className="ydiskarc")
     App(root, url)
+    if smoke_test:
+        # Used by the build to check that the packaged app starts.
+        def done() -> None:
+            print(f"smoke test ok: Tk {root.tk.call('info', 'patchlevel')}", flush=True)
+            root.destroy()
+
+        root.after(1500, done)
     root.mainloop()
 
 
 def main() -> None:
-    url = sys.argv[1] if len(sys.argv) > 1 else None
-    run_gui(url)
+    # macOS used to pass "-psn_..." to apps started from Finder.
+    args = [a for a in sys.argv[1:] if not a.startswith("-psn_")]
+    smoke_test = "--smoke-test" in args
+    urls = [a for a in args if not a.startswith("-")]
+    run_gui(urls[0] if urls else None, smoke_test=smoke_test)
 
 
 if __name__ == "__main__":

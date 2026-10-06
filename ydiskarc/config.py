@@ -1,5 +1,6 @@
 """Configuration module for ydiskarc."""
 
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -38,7 +39,8 @@ class Config:
     user_agent: Optional[str] = None  # Auto-generated if None
 
     def __post_init__(self) -> None:
-        """Initialize user agent if not provided."""
+        """Initialize user agent if not provided; allow overriding the API URL (for tests)."""
+        self.api_base_url = os.environ.get("YDISKARC_API_BASE_URL") or self.api_base_url
         if self.user_agent is None:
             self.user_agent = (
                 f"ydiskarc/{ydiskarc.__version__} (https://github.com/ruarxive/ydiskarc)"

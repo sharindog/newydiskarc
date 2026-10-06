@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-10-06
+
+### Added
+- macOS (Apple Silicon) app: `ydiskarc.app` in a DMG, built by GitHub Actions
+  (`.github/workflows/macos-dmg.yml`) on every push and attached to releases for `v*` tags;
+  signed and notarized when Apple Developer secrets are configured
+- macOS GUI integration: native menu bar (Edit menu, About), Cmd+C/V/X/A also with the
+  Russian layout, Cmd+Q asks before stopping a download, right click with Ctrl+click or
+  two fingers, Retina and dark mode support in the bundle
+- The computer does not go to sleep while downloading (macOS `caffeinate`, Windows
+  `SetThreadExecutionState`); the display may still turn off
+- `YDISKARC_API_BASE_URL` environment variable (used to test packaged builds)
+
 ## [1.3.0] - 2026-09-28
 
 ### Added

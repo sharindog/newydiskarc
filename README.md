@@ -50,6 +50,33 @@ $ pip install --upgrade ydiskarc
 
 Python version 3.9 or greater is required.
 
+## macOS (Apple Silicon)
+
+A ready-to-use app is built by GitHub Actions for every change:
+
+* releases: download `ydiskarc-<version>-macos-arm64.dmg` from the
+  [Releases](https://github.com/sharindog/newydiskarc/releases) page (pushed `v*` tags);
+* any build: open the latest run of the **macOS DMG** workflow on the
+  [Actions](https://github.com/sharindog/newydiskarc/actions/workflows/macos-dmg.yml) page
+  and download the artifact (a zip with the DMG inside).
+
+Open the DMG and drag **ydiskarc** to **Applications**. Unless the build was signed with an
+Apple Developer certificate, macOS warns on the first start that it cannot check the
+developer: open **System Settings → Privacy & Security** and press **Open Anyway**, or run
+`xattr -dr com.apple.quarantine /Applications/ydiskarc.app` in Terminal.
+
+The command line tool is inside the app:
+`/Applications/ydiskarc.app/Contents/MacOS/ydiskarc sync URL -o DIR`.
+
+While a download is running the Mac does not go to sleep (the display may turn off).
+
+To build the app yourself on a Mac: install Python from python.org (it includes Tk), then
+`pip install . pyinstaller && pyinstaller packaging/macos/ydiskarc.spec` and
+`packaging/macos/make_dmg.sh <version>`. To sign and notarize in CI, add the repository
+secrets `MACOS_CERTIFICATE_P12` (base64 of a "Developer ID Application" .p12),
+`MACOS_CERTIFICATE_PASSWORD`, `MACOS_CODESIGN_IDENTITY`, `APPLE_ID`, `APPLE_TEAM_ID` and
+`APPLE_APP_PASSWORD` (an app-specific password).
+
 ## Graphical interface
 
 ```bash
@@ -274,6 +301,10 @@ Files not downloaded: 1
   каждый файл сверяется по размеру и SHA-256 и получает исходную дату.
 * Ошибка скачивания — это предупреждение, а не текст ошибки внутри файла; неудачные файлы и
   папки повторяются (`-r`), в конце печатается статистика и список нескачанных файлов.
+* Mac (Apple Silicon): готовый DMG собирается GitHub Actions — на странице Releases или в
+  артефактах последнего запуска workflow «macOS DMG». Перетащите ydiskarc в «Программы»;
+  если macOS не даёт открыть — «Системные настройки» → «Конфиденциальность и безопасность» →
+  «Всё равно открыть». Во время закачки компьютер не засыпает.
 * `-t N` — сколько файлов качать одновременно, `-c N` — сколько соединений на один файл
   (большие файлы качаются кусками параллельно; Яндекс ограничивает скорость одного
   соединения, так что это главный способ ускориться), `--flat` — все файлы в одну папку (для очень длинных

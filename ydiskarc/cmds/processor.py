@@ -9,6 +9,7 @@ import yaml
 
 from ydiskarc.client import YandexDiskClient, parse_public_url
 from ydiskarc.downloader import ResourceDownloader
+from ydiskarc.power import KeepAwake
 from ydiskarc.progress import FileTask, Reporter, SyncStats
 from ydiskarc.sync import METADATA_FILENAME, SyncEngine
 from ydiskarc.utils import (
@@ -25,6 +26,32 @@ logger = logging.getLogger(__name__)
 
 
 def yd_get_full(
+    url: str,
+    output: Optional[str],
+    filename: Optional[str],
+    metadata: bool,
+    verbose: bool = False,
+    reporter: Optional[Reporter] = None,
+    cancel_event: Optional[threading.Event] = None,
+    safe_names: Optional[bool] = None,
+    connections: Optional[int] = None,
+) -> SyncStats:
+    """Download a public file, or a public folder as a ZIP archive."""
+    with KeepAwake():
+        return _yd_get_full(
+            url,
+            output,
+            filename,
+            metadata,
+            verbose,
+            reporter,
+            cancel_event,
+            safe_names,
+            connections,
+        )
+
+
+def _yd_get_full(
     url: str,
     output: Optional[str],
     filename: Optional[str],

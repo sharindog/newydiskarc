@@ -1,5 +1,7 @@
 """Tests for core CLI module."""
 
+import re
+
 from unittest.mock import patch, MagicMock
 
 try:
@@ -165,7 +167,8 @@ class TestCLI:
     def test_sync_accepts_subfolder_url(self):
         result = self.runner.invoke(app, ["sync", "--help"])
         assert result.exit_code == 0
-        assert "--threads" in result.stdout
+        # rich colours the help on CI (GitHub Actions); compare the plain text
+        assert "--threads" in re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
 
     def test_default_output(self):
         assert default_output("https://disk.yandex.ru/d/ABC123") == "ABC123"

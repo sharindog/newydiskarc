@@ -16,6 +16,7 @@ from .client import ApiError, PublicUrl, YandexDiskClient, parse_public_url
 from .config import config
 from .downloader import ResourceDownloader
 from .i18n import tr
+from .power import KeepAwake
 from .progress import FileTask, Reporter, SyncStats
 from .utils import (
     Cancelled,
@@ -323,6 +324,10 @@ class SyncEngine:
     # ------------------------------------------------------------------ main
 
     def run(self) -> SyncStats:
+        with KeepAwake():
+            return self._run()
+
+    def _run(self) -> SyncStats:
         stats = self.stats
         stats.started = time.time()
         try:
